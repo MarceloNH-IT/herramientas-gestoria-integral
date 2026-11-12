@@ -1,20 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-Gestoría Integral | Buscador de infracciones por patente
-Ejecutar con:  streamlit run app.py
-Requisitos:    pip install streamlit pandas
-IMPORTANTE:    guardar este archivo con codificación UTF-8 (evita los textos rotos "Ã³", "â€”").
+Gestoría Integral | Buscador de infracciones por patente (100% Streamlit + HTTP Directo)
+Sin navegadores externos (Sin Playwright / Sin Selenium / Sin Chromium).
+Ejecutar con:   streamlit run app.py
+Requisitos:     pip install streamlit httpx beautifulsoup4
 """
 from __future__ import annotations
 
 import asyncio
 import html
+import os
 import random
 import re
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, List
 
+import httpx
 import streamlit as st
+from bs4 import BeautifulSoup
 
 # =============================================================================
 # 1. CONFIGURACIÓN DE PÁGINA Y ESTILOS
@@ -135,6 +138,12 @@ a.portal { color:#2563eb; font-weight:600; text-decoration:none; }
 """
 st.markdown(CSS, unsafe_allow_html=True)
 
+HEADERS_HTTP = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,*/*;q=0.8",
+    "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
+}
+
 
 # =============================================================================
 # 2. MODELOS DE DATOS
@@ -143,7 +152,7 @@ st.markdown(CSS, unsafe_allow_html=True)
 class Infraccion:
     acta: str
     descripcion: str
-    monto: float | None  # None = sin monto informado
+    monto: float | None
     controlador: bool = False
 
 
@@ -152,7 +161,7 @@ class ResultadoJurisdiccion:
     nombre: str
     proteccion: str
     url: str
-    conectado: bool = False  # True solo cuando existe un scraper real
+    conectado: bool = False
     error: str = ""
     demo: bool = False
     infracciones: List[Infraccion] = field(default_factory=list)
@@ -165,40 +174,314 @@ class ResultadoJurisdiccion:
 @dataclass
 class JurisdiccionConfig:
     nombre: str
-    proteccion: str  # "Sin CAPTCHA" | "reCAPTCHA" | "CAPTCHA Texto" | "Cloudflare"
+    proteccion: str
     url: str
     consultar: Callable[[str], Awaitable[List[Infraccion]]] | None = None
-    # `consultar` es el lugar donde se programa el scraper real de cada portal.
-    # Debe devolver la lista de Infraccion (vacía si no hay multas) o lanzar excepción.
 
 
 # =============================================================================
-# 3. CONECTORES (acá se enchufan los scrapers reales, uno por jurisdicción)
+# 3. CLIENTE ANTI-CAPTCHA Y PARSEADORES HTTP PUROS (SIN NAVEGADOR)
 # =============================================================================
-# Ejemplo de cómo se completa un conector real (Playwright / requests):
-#
-#   async def scrap_rosario(patente: str) -> List[Infraccion]:
-#       ...  # navegar, completar la patente, parsear la tabla
-#       return [Infraccion("12345", "Exceso de velocidad", 45000.0)]
-#
-# y luego en JURISDICCIONES poner  consultar=scrap_rosario
+class CaptchaSolver:
+    def __init__(self, provider: str = "2captcha", api_key: str = ""):
+        self.provider = provider.lower().strip()
+        self.api_key = api_key.strip()
+
+    async def solve_recaptcha_v2(self, site_key: str, page_url: str, invisible: bool = False) -> str:
+        if not self.api_key:
+            raise RuntimeError("Configurá tu API Key de Captcha en 'Opciones de desarrollo y Captcha'.")
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            if self.provider == "capsolver":
+                payload = {
+                    "clientKey": self.api_key,
+                    "task": {
+                        "type": "ReCaptchaV2TaskProxyLess",
+                        "websiteURL": page_url,
+                        "websiteKey": site_key,
+                        "isInvisible": invisible,
+                    },
+                }
+                r = await client.post("https://api.capsolver.com/createTask", json=payload)
+                data = r.json()
+                if data.get("errorId", 0) != 0:
+                    raise RuntimeError(f"CapSolver: {data.get('errorDescription')}")
+                task_id = data["taskId"]
+
+                for _ in range(40):
+                    await asyncio.sleep(2.5)
+                    res = await client.post(
+                        "https://api.capsolver.com/getTaskResult",
+                        json={"clientKey": self.api_key, "taskId": task_id},
+                    )
+                    res_data = res.json()
+                    if res_data.get("status") == "ready":
+                        return res_data["solution"]["gRecaptchaResponse"]
+                    if res_data.get("errorId", 0) != 0:
+                        raise RuntimeError(f"CapSolver: {res_data.get('errorDescription')}")
+            else:
+                params = {
+                    "key": self.api_key,
+                    "method": "userrecaptcha",
+                    "googlekey": site_key,
+                    "pageurl": page_url,
+                    "invisible": 1 if invisible else 0,
+                    "json": 1,
+                }
+                r = await client.get("http://2captcha.com/in.php", params=params)
+                data = r.json()
+                if data.get("status") != 1:
+                    raise RuntimeError(f"2Captcha: {data.get('request')}")
+                req_id = data["request"]
+
+                for _ in range(40):
+                    await asyncio.sleep(4)
+                    res = await client.get(
+                        "http://2captcha.com/res.php",
+                        params={"key": self.api_key, "action": "get", "id": req_id, "json": 1},
+                    )
+                    res_data = res.json()
+                    if res_data.get("status") == 1:
+                        return res_data["request"]
+                    if res_data.get("request") != "CAPCHA_NOT_READY":
+                        raise RuntimeError(f"2Captcha: {res_data.get('request')}")
+
+        raise TimeoutError("Tiempo agotado esperando la solución del Captcha.")
+
+
+def limpiar_monto(texto: str) -> float | None:
+    if not texto:
+        return None
+    limpio = re.sub(r"[^\d,.]", "", str(texto))
+    if not limpio:
+        return None
+    if "," in limpio and "." in limpio:
+        limpio = limpio.replace(".", "").replace(",", ".")
+    elif "," in limpio:
+        limpio = limpio.replace(",", ".")
+    try:
+        return float(limpio)
+    except ValueError:
+        return None
+
+
+def extraer_sitekey_html(html_text: str) -> str | None:
+    """Busca la clave pública de Google reCAPTCHA directamente en el código fuente HTML/JS."""
+    patrones = [
+        r'data-sitekey=["\']([0-9A-Za-z_-]{40})["\']',
+        r'sitekey\s*:\s*["\']([0-9A-Za-z_-]{40})["\']',
+        r'recaptcha/api\.js\?[^"\']*render=([0-9A-Za-z_-]{40})',
+        r'[?&]k=([0-9A-Za-z_-]{40})',
+    ]
+    for p in patrones:
+        m = re.search(p, html_text)
+        if m:
+            return m.group(1)
+    return None
+
+
+def parsear_tabla_html(html_content: str) -> List[Infraccion]:
+    if re.search(r"no registra|no posee|sin infracciones|no se encontraron|libre de deuda|sin deuda", html_content, re.I):
+        return []
+    soup = BeautifulSoup(html_content, "html.parser")
+    multas: List[Infraccion] = []
+    for tr in soup.select("table tbody tr, table tr"):
+        cols = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+        if len(cols) >= 3 and any(c.isdigit() for c in cols[0]):
+            multas.append(
+                Infraccion(
+                    acta=cols[0][:30],
+                    descripcion=cols[1][:120] or "Infracción de tránsito",
+                    monto=limpiar_monto(cols[-1]),
+                    controlador="controlador" in " ".join(cols).lower(),
+                )
+            )
+    return multas
+
+
+# =============================================================================
+# 4. CONECTORES HTTP PUROS (9 JURISDICCIONES SIN CHROMIUM)
+# =============================================================================
+
+# --- 1. POSADAS (Sin Captcha - POST Directo) ---
+async def http_posadas(patente: str) -> List[Infraccion]:
+    url = "https://sistema.posadas.gov.ar/mp_sistemas/autogestion/consultarmultadominio"
+    async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=25, headers=HEADERS_HTTP) as client:
+        r_get = await client.get(url)
+        soup = BeautifulSoup(r_get.text, "html.parser")
+        form_data = {i["name"]: i.get("value", "") for i in soup.find_all("input", {"type": "hidden"}) if i.get("name")}
+        inp_dom = soup.find("input", {"type": "text"})
+        campo = inp_dom["name"] if (inp_dom and inp_dom.get("name")) else "dominio"
+        form_data[campo] = patente
+        r_post = await client.post(url, data=form_data)
+        return parsear_tabla_html(r_post.text)
+
+
+# --- 2. LOMAS DE ZAMORA (Sin Captcha - ASP.NET ViewState HTTP) ---
+async def http_lomas(patente: str) -> List[Infraccion]:
+    url = "https://webextra.lomasdezamora.gov.ar/infracciones/ConsultaFaltasNuevoMP.aspx"
+    async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=25, headers=HEADERS_HTTP) as client:
+        r_get = await client.get(url)
+        soup = BeautifulSoup(r_get.text, "html.parser")
+        # Captura todos los campos ocultos de ASP.NET (__VIEWSTATE, __EVENTVALIDATION, etc.)
+        form_data = {i["name"]: i.get("value", "") for i in soup.find_all("input", {"type": "hidden"}) if i.get("name")}
+        for inp in soup.find_all("input", {"type": "text"}):
+            if inp.get("name"):
+                form_data[inp["name"]] = patente
+        btn = soup.find("input", {"type": "submit"})
+        if btn and btn.get("name"):
+            form_data[btn["name"]] = btn.get("value", "Consultar")
+        r_post = await client.post(url, data=form_data)
+        return parsear_tabla_html(r_post.text)
+
+
+# --- 3. ROSARIO (Sin Captcha - Formulario HTTP) ---
+async def http_rosario(patente: str) -> List[Infraccion]:
+    url = "https://www.rosario.gob.ar/gdm/patente.do?accion=ir"
+    async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=25, headers=HEADERS_HTTP) as client:
+        r_get = await client.get(url)
+        soup = BeautifulSoup(r_get.text, "html.parser")
+        form = soup.find("form")
+        post_url = url
+        if form and form.get("action"):
+             post_url = str(httpx.URL(url).join(form["action"]))
+        form_data = {i["name"]: i.get("value", "") for i in soup.find_all("input", {"type": "hidden"}) if i.get("name")}
+        inp_txt = soup.find("input", {"type": "text"})
+        campo = inp_txt["name"] if (inp_txt and inp_txt.get("name")) else "dominio"
+        form_data[campo] = patente
+        r_post = await client.post(post_url, data=form_data)
+        return parsear_tabla_html(r_post.text)
+
+
+# --- 4. EZEIZA / INFRATRACK (Con reCAPTCHA por HTTP) ---
+async def http_ezeiza(patente: str, solver: CaptchaSolver) -> List[Infraccion]:
+    url = "https://consulta-web.infratrack.com.ar/consultas.php?municipio=ezeiza"
+    async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=35, headers=HEADERS_HTTP) as client:
+        r_get = await client.get(url)
+        soup = BeautifulSoup(r_get.text, "html.parser")
+        sitekey = extraer_sitekey_html(r_get.text)
+
+        form_data = {i["name"]: i.get("value", "") for i in soup.find_all("input", {"type": "hidden"}) if i.get("name")}
+        inp_txt = soup.find("input", {"type": "text"})
+        campo = inp_txt["name"] if (inp_txt and inp_txt.get("name")) else "dominio"
+        form_data[campo] = patente
+
+        if sitekey:
+            token = await solver.solve_recaptcha_v2(sitekey, url)
+            form_data["g-recaptcha-response"] = token
+
+        form = soup.find("form")
+        post_url = str(httpx.URL(url).join(form["action"])) if (form and form.get("action")) else url
+        r_post = await client.post(post_url, data=form_data)
+        return parsear_tabla_html(r_post.text)
+
+
+# --- 5. ENTRE RÍOS Y 6. MISIONES (Monitoreo Vial REST/HTTP + reCAPTCHA) ---
+async def http_monitoreo_vial(base_url: str, patente: str, solver: CaptchaSolver) -> List[Infraccion]:
+    async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=35, headers=HEADERS_HTTP) as client:
+        r_get = await client.get(base_url)
+        sitekey = extraer_sitekey_html(r_get.text)
+        token = await solver.solve_recaptcha_v2(sitekey, base_url) if sitekey else ""
+
+        # Intenta consultar el endpoint del formulario/API con el token resuelto
+        soup = BeautifulSoup(r_get.text, "html.parser")
+        form_data = {"dominio": patente, "patente": patente, "g-recaptcha-response": token}
+        for i in soup.find_all("input", {"type": "hidden"}):
+            if i.get("name"):
+                form_data[i["name"]] = i.get("value", "")
+
+        r_post = await client.post(base_url, data=form_data)
+        return parsear_tabla_html(r_post.text)
+
+
+# --- 7. PBA, 8. CABA Y 9. LANÚS (Formulario/Endpoint HTTP + reCAPTCHA) ---
+async def http_portal_recaptcha_generico(url: str, patente: str, solver: CaptchaSolver, invisible: bool = False) -> List[Infraccion]:
+    async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=40, headers=HEADERS_HTTP) as client:
+        r_get = await client.get(url)
+        soup = BeautifulSoup(r_get.text, "html.parser")
+        sitekey = extraer_sitekey_html(r_get.text)
+
+        form_data = {i["name"]: i.get("value", "") for i in soup.find_all("input", {"type": "hidden"}) if i.get("name")}
+        # Cubrimos las variantes de nombres de campo más usadas en portales oficiales
+        form_data["dominio"] = patente
+        form_data["patente"] = patente
+        for inp in soup.find_all("input", {"type": "text"}):
+            if inp.get("name"):
+                form_data[inp["name"]] = patente
+
+        if sitekey:
+            token = await solver.solve_recaptcha_v2(sitekey, url, invisible=invisible)
+            form_data["g-recaptcha-response"] = token
+
+        form = soup.find("form")
+        post_url = str(httpx.URL(url).join(form["action"])) if (form and form.get("action")) else url
+        r_post = await client.post(post_url, data=form_data)
+        return parsear_tabla_html(r_post.text)
+
+
+# =============================================================================
+# 5. CONFIGURACIÓN DE JURISDICCIONES Y COLORES
+# =============================================================================
+if "solver" not in st.session_state:
+    st.session_state["solver"] = CaptchaSolver("2captcha", os.getenv("CAPTCHA_API_KEY", ""))
+
+
+def _solver() -> CaptchaSolver:
+    return st.session_state["solver"]
+
+
 JURISDICCIONES: List[JurisdiccionConfig] = [
-    JurisdiccionConfig("Posadas (Misiones)", "Sin CAPTCHA", "https://sistema.posadas.gov.ar/mp_sistemas/autogestion/consultarmultadominio"),
-    JurisdiccionConfig("Rosario", "Sin CAPTCHA", "https://www.rosario.gob.ar/gdm/patente.do?accion=ir"),
-    JurisdiccionConfig("Lomas de Zamora", "Sin CAPTCHA", "https://webextra.lomasdezamora.gov.ar/infracciones/ConsultaFaltasNuevoMP.aspx"),
+    JurisdiccionConfig(
+        "Posadas (Misiones)", "Sin CAPTCHA",
+        "https://sistema.posadas.gov.ar/mp_sistemas/autogestion/consultarmultadominio",
+        consultar=lambda pat: http_posadas(pat),
+    ),
+    JurisdiccionConfig(
+        "Rosario", "Sin CAPTCHA",
+        "https://www.rosario.gob.ar/gdm/patente.do?accion=ir",
+        consultar=lambda pat: http_rosario(pat),
+    ),
+    JurisdiccionConfig(
+        "Lomas de Zamora", "Sin CAPTCHA",
+        "https://webextra.lomasdezamora.gov.ar/infracciones/ConsultaFaltasNuevoMP.aspx",
+        consultar=lambda pat: http_lomas(pat),
+    ),
+    JurisdiccionConfig(
+        "PBA", "reCAPTCHA",
+        "https://infraccionesba.gba.gob.ar/consulta-infraccion",
+        consultar=lambda pat: http_portal_recaptcha_generico("https://infraccionesba.gba.gob.ar/consulta-infraccion", pat, _solver(), invisible=True),
+    ),
+    JurisdiccionConfig(
+        "CABA", "reCAPTCHA",
+        "https://buenosaires.gob.ar/licenciasdeconducir/consulta-de-infracciones/?actas=transito",
+        consultar=lambda pat: http_portal_recaptcha_generico("https://buenosaires.gob.ar/licenciasdeconducir/consulta-de-infracciones/?actas=transito", pat, _solver()),
+    ),
+    JurisdiccionConfig(
+        "Ezeiza", "reCAPTCHA",
+        "https://consulta-web.infratrack.com.ar/consultas.php?municipio=ezeiza",
+        consultar=lambda pat: http_ezeiza(pat, _solver()),
+    ),
+    JurisdiccionConfig(
+        "Entre Ríos", "reCAPTCHA",
+        "https://monitoreovialentrerios.info/#/consulta-infracciones",
+        consultar=lambda pat: http_monitoreo_vial("https://monitoreovialentrerios.info/", pat, _solver()),
+    ),
+    JurisdiccionConfig(
+        "Misiones", "reCAPTCHA",
+        "https://monitoreovialmisiones.info/#/",
+        consultar=lambda pat: http_monitoreo_vial("https://monitoreovialmisiones.info/", pat, _solver()),
+    ),
+    JurisdiccionConfig(
+        "Lanús", "reCAPTCHA",
+        "https://tramitesweb.lanus.gob.ar/lanusdigital/mis-dominios",
+        consultar=lambda pat: http_portal_recaptcha_generico("https://tramitesweb.lanus.gob.ar/lanusdigital/mis-dominios", pat, _solver()),
+    ),
     JurisdiccionConfig("Córdoba Caminera", "Sin CAPTCHA", "https://www.rentascordoba.gob.ar/emision/ver-y-pagar/caminera"),
-    JurisdiccionConfig("PBA", "reCAPTCHA", "https://infraccionesba.gba.gob.ar/consulta-infraccion"),
-    JurisdiccionConfig("CABA", "reCAPTCHA", "https://buenosaires.gob.ar/licenciasdeconducir/consulta-de-infracciones/?actas=transito"),
-    JurisdiccionConfig("Ezeiza", "reCAPTCHA", "https://consulta-web.infratrack.com.ar/consultas.php?municipio=ezeiza"),
-    JurisdiccionConfig("Entre Ríos", "reCAPTCHA", "https://monitoreovialentrerios.info/#/consulta-infracciones"),
-    JurisdiccionConfig("Misiones", "reCAPTCHA", "https://monitoreovialmisiones.info/#/"),
-    JurisdiccionConfig("Lanús", "reCAPTCHA", "https://tramitesweb.lanus.gob.ar/lanusdigital/mis-dominios"),
     JurisdiccionConfig("Santa Fe", "CAPTCHA Texto", "https://www.santafe.gov.ar/juzgadovirtual/consultaInfraccion.do?method=BusquedaVehiculo"),
     JurisdiccionConfig("Vicente López", "Cloudflare", "https://infracciones.vicentelopez.gov.ar/causas-vecino"),
     JurisdiccionConfig("Avellaneda", "Cloudflare", "https://multas.mda.gob.ar"),
 ]
 
-# Colores (fondo del chip, color del punto) que se asignan por jurisdicción
 PALETA = [
     ("#ffdf5c", "#f5c400"), ("#a5d8ff", "#3b9cf0"), ("#d4c1ff", "#9b7bf0"),
     ("#b9f0cf", "#34c776"), ("#ffd0c2", "#f4724e"), ("#ffc9e3", "#e8559f"),
@@ -212,7 +495,7 @@ def color_de(nombre: str) -> tuple[str, str]:
 
 
 # =============================================================================
-# 4. MOTOR DE EJECUCIÓN
+# 6. MOTOR DE EJECUCIÓN ASÍNCRONO
 # =============================================================================
 PATRON_PATENTE = re.compile(r"^([A-Z]{3}\d{3}|[A-Z]{2}\d{3}[A-Z]{2}|[A-Z]\d{3}[A-Z]{3}|\d{3}[A-Z]{3})$")
 
@@ -224,12 +507,11 @@ def normalizar_patente(texto: str) -> str:
 def pesos(valor: float | None) -> str:
     if valor is None:
         return "-"
-    s = f"{valor:,.2f}"  # 1,234.50
+    s = f"{valor:,.2f}"
     return "$" + s.replace(",", "X").replace(".", ",").replace("X", ".")
 
 
 def _demo_infracciones(patente: str, nombre: str) -> List[Infraccion]:
-    """Datos SIMULADOS, solo para probar el diseño. Nunca se usan salvo modo demo."""
     rnd = random.Random(f"{patente}-{nombre}")
     if rnd.random() < 0.45:
         return []
@@ -254,17 +536,17 @@ def _demo_infracciones(patente: str, nombre: str) -> List[Infraccion]:
 async def _consultar_una(cfg: JurisdiccionConfig, patente: str, demo: bool) -> ResultadoJurisdiccion:
     base = ResultadoJurisdiccion(cfg.nombre, cfg.proteccion, cfg.url)
     try:
-        if cfg.consultar is not None:
-            base.infracciones = await asyncio.wait_for(cfg.consultar(patente), timeout=45)
-            base.conectado = True
-        elif demo:
+        if demo:
             await asyncio.sleep(random.uniform(0.2, 0.7))
             base.infracciones = _demo_infracciones(patente, cfg.nombre)
             base.conectado = True
             base.demo = True
+        elif cfg.consultar is not None:
+            base.infracciones = await asyncio.wait_for(cfg.consultar(patente), timeout=65)
+            base.conectado = True
         else:
-            await asyncio.sleep(0.05)  # sin conector todavía
-    except Exception as exc:  # un portal caído no debe romper al resto
+            await asyncio.sleep(0.05)
+    except Exception as exc:
         base.error = f"{type(exc).__name__}: {exc}"
     return base
 
@@ -294,7 +576,7 @@ def overlay(pct: int, estado: str) -> str:
 
 
 # =============================================================================
-# 5. INTERFAZ
+# 7. INTERFAZ DE USUARIO (100% EN STREAMLIT)
 # =============================================================================
 n_jur = len(JURISDICCIONES)
 chips = "".join(f'<span class="chip"><span class="dot"></span>{html.escape(j.nombre)}</span>' for j in JURISDICCIONES)
@@ -338,12 +620,23 @@ with st.form("buscador", clear_on_submit=False, border=True):
     with c2:
         enviar = st.form_submit_button("🔎  Consultar", use_container_width=True)
 
-with st.expander("⚙️ Opciones de desarrollo"):
+with st.expander("⚙️ Opciones de desarrollo y Captcha"):
+    col_p, col_k = st.columns([1, 2])
+    with col_p:
+        proveedor_captcha = st.selectbox("Proveedor de Captcha", ["2captcha", "capsolver"])
+    with col_k:
+        api_key_captcha = st.text_input(
+            "API Key del Captcha pago",
+            value=os.getenv("CAPTCHA_API_KEY", ""),
+            type="password",
+            placeholder="Pegá acá tu API Key de 2Captcha o CapSolver",
+        )
     demo = st.checkbox(
         "Modo demo (datos SIMULADOS, solo para probar el diseño)",
         value=False,
-        help="Apagado por defecto. Con esto activo NO se consulta ningún portal real.",
+        help="Apagado por defecto. Con esto activo NO se consulta ningún portal real ni se consume saldo.",
     )
+    st.session_state["solver"] = CaptchaSolver(proveedor_captcha, api_key_captcha)
 
 # --- Ejecución ---------------------------------------------------------------
 if enviar:
@@ -445,7 +738,7 @@ if "resultados" in st.session_state:
         )
 
     if conectados and not con_multas:
-        st.markdown(f'<div class="ok">✅ La patente {html.escape(dominio)} no registra infracciones en las jurisdicciones consultadas.</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="ok">✅ La patente {html.escape(dominio)} no registra infracciones en las jurisdicciones consultadas automáticamente.</div>', unsafe_allow_html=True)
 
     # Jurisdicciones sin conector o con error
     if sin_conector:
@@ -456,9 +749,9 @@ if "resultados" in st.session_state:
             for r in sin_conector
         )
         st.markdown(
-            '<div class="card"><h3><i style="background:#9ca3af"></i>Consulta manual en el portal oficial</h3>'
-            f'<p style="color:#6b7280;font-size:.88rem;margin-top:-.4rem">Copiá la patente <b>{html.escape(dominio)}</b> y consultala en cada portal. '
-            'Estas jurisdicciones todavía no tienen scraper automático.</p>'
+            '<div class="card"><h3><i style="background:#9ca3af"></i>Consulta manual / Estado de portales</h3>'
+            f'<p style="color:#6b7280;font-size:.88rem;margin-top:-.4rem">Patente consultada: <b>{html.escape(dominio)}</b>. '
+            'Si algún portal gubernamental requiere validación adicional, podés abrirlo directo desde acá:</p>'
             '<table class="t"><thead><tr><th>Jurisdicción</th><th>Protección</th><th>Estado</th><th>Acceso</th></tr></thead>'
             f"<tbody>{filas_p}</tbody></table></div>",
             unsafe_allow_html=True,
