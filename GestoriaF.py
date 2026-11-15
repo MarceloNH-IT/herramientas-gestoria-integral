@@ -1,24 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Gestoría Integral | Buscador de infracciones por patente (Streamlit + HTTP directo + CapSolver)
-Ejecutar con:   streamlit run GestoriaF.py
-Requisitos:     pip install streamlit httpx beautifulsoup4
+Marcelo Nuñez Gestiones | Buscador de infracciones por patente
+Streamlit + HTTP directo + APIs REST + CapSolver (reCAPTCHA v2 + OCR Imagen).
 
-Cambios clave respecto a la versión anterior:
-  * Cada portal devuelve un ESTADO explícito (con_multas / sin_multas / error /
-    captcha_fallido / indeterminado / sin_conector). Ya no se confunde "no pude leer
-    el portal" con "no tiene multas".
-  * El parser ignora <script>/<style>, detecta columnas por encabezado y soporta JSON.
-  * Se valida el formulario ANTES de gastar un captcha (si el portal es una SPA sin
-    formulario, no se consume saldo de CapSolver).
-  * El sitekey también se busca dentro de los .js del portal (SPAs).
-  * Timeouts coherentes con el tiempo de resolución del captcha.
-  * El total se marca como PARCIAL si algún portal falló.
-  * Resumen en JSON (con descarga) y panel de diagnóstico por portal.
+Archivos que van juntos en el repositorio:
+  GestoriaF.py            (este archivo)
+  logo.png                (tu logo, al lado del .py)
+  requirements.txt
+  .streamlit/config.toml  (tema oscuro)
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import html
 import json
 import os
@@ -26,8 +20,9 @@ import random
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Awaitable, Callable, List
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -35,126 +30,197 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 # =============================================================================
-# 1. CONFIGURACIÓN DE PÁGINA Y ESTILOS
+# 0. DATOS DE MARCA
 # =============================================================================
+WHATSAPP_NUM = "5491122533325"
+WHATSAPP_TXT = "+54 9 11 2253-3325"
+INSTAGRAM = "marcelonunezgestiones"
+EMAIL = "marcelonunezgestiones@gmail.com"
+WA_BASE = f"https://wa.me/{WHATSAPP_NUM}"
+
 st.set_page_config(
-    page_title="Buscar infracciones por patente",
+    page_title="Marcelo Nuñez Gestiones | Buscador de infracciones",
     page_icon="⚖️",
     layout="centered",
     initial_sidebar_state="collapsed",
 )
 
+
+def cargar_logo_b64() -> str:
+    base = Path(__file__).resolve().parent
+    for ruta in (base / "logo.png", base / "assets" / "logo.png"):
+        if ruta.exists():
+            return base64.b64encode(ruta.read_bytes()).decode()
+    return ""
+
+
+LOGO_B64 = cargar_logo_b64()
+
+# =============================================================================
+# 1. ESTILOS
+# =============================================================================
 CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Rubik:wght@400;500;600;800;900&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@400;500;600;700&display=swap');
+:root{
+  --bg:#080e1f; --card:#111a33; --card2:#0d1530; --line:rgba(201,168,76,.24);
+  --gold:#c9a84c; --gold2:#e6c56a; --txt:#e8ecf5; --mut:#93a0bd;
+}
+html, body, [class*="css"], .stApp, input, button, select { font-family:'DM Sans', sans-serif !important; }
+.stApp{
+  color:var(--txt);
+  background:
+    radial-gradient(1200px 600px at 15% -10%, rgba(40,60,130,.35), transparent 60%),
+    linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px),
+    var(--bg);
+  background-size:auto, 48px 48px, 48px 48px, auto;
+}
+header[data-testid="stHeader"]{ background:transparent; }
+[data-testid="stSidebar"], [data-testid="collapsedControl"]{ display:none; }
+.block-container{ max-width:1080px; padding-top:.6rem; padding-bottom:4rem; }
+#MainMenu, footer{ visibility:hidden; }
+h1,h2,h3,.bebas{ font-family:'Bebas Neue', sans-serif !important; letter-spacing:.02em; font-weight:400; }
 
-html, body, [class*="css"], .stApp, input, button { font-family: 'Rubik', sans-serif !important; }
-.stApp { background: #f7f6f2; color: #0f172a; }
-header[data-testid="stHeader"] { background: transparent; }
-[data-testid="stSidebar"], [data-testid="collapsedControl"] { display: none; }
-.block-container { max-width: 1080px; padding-top: 1.2rem; padding-bottom: 4rem; }
-#MainMenu, footer { visibility: hidden; }
+/* ---------- BARRA SUPERIOR ---------- */
+.topbar{ display:flex; justify-content:space-between; align-items:center; padding:.9rem 0 1rem;
+  border-bottom:1px solid rgba(255,255,255,.07); margin-bottom:1.6rem; }
+.brand b{ display:block; font-size:.95rem; letter-spacing:.22em; font-weight:700; color:#fff; }
+.brand span{ display:block; font-size:.62rem; letter-spacing:.22em; color:var(--gold); margin-top:2px; }
+.btn{ display:inline-block; background:var(--gold); color:#0a1124 !important; font-weight:700; font-size:.86rem;
+  padding:.7rem 1.2rem; border-radius:8px; text-decoration:none !important; border:1px solid var(--gold);
+  box-shadow:0 8px 24px rgba(201,168,76,.18); }
+.btn.ghost{ background:transparent; color:#fff !important; border:1px solid rgba(255,255,255,.18); box-shadow:none; }
+.btn.sm{ padding:.5rem .95rem; font-size:.78rem; }
 
 /* ---------- HERO ---------- */
-.hero {
-  background: linear-gradient(135deg, #ffe45c 0%, #fff0a0 55%, #f8eeb0 100%);
-  border: 1px solid #ecd45a; border-radius: 28px; padding: 2rem 2rem 1.6rem;
-  margin-bottom: 1rem;
-}
-.hero h1 { font-weight: 900; font-size: 3rem; line-height: 1.02; letter-spacing: -0.03em;
-  color: #0b1220; margin: 0 0 .8rem 0; }
-.hero p.lead { color: #3b3a2f; font-size: 1.02rem; margin: 0 0 1rem 0; font-weight: 500; }
-.pill { display: inline-flex; align-items: center; gap: 6px; background: rgba(255,255,255,.55);
-  border: 1px solid rgba(0,0,0,.06); border-radius: 999px; padding: 7px 14px;
-  font-size: .8rem; font-weight: 700; color: #111827; margin: 0 8px 8px 0; }
-.panel { background: rgba(255,255,255,.55); border: 1px solid rgba(0,0,0,.06);
-  border-radius: 18px; padding: 1rem 1.2rem; margin-top: .6rem; }
-.panel-head { display:flex; justify-content:space-between; align-items:center; }
-.panel-title { font-weight: 800; font-size: 1rem; color:#0b1220; }
-.panel-tag { font-size:.72rem; font-weight:700; color:#6b6a5c; }
-.panel-sub { font-size:.78rem; font-weight:700; color:#6b6a5c; margin:.35rem 0 .7rem; }
-.chip { display:inline-flex; align-items:center; gap:7px; background:#fff; border-radius:999px;
-  padding:7px 14px; font-size:.82rem; font-weight:500; margin:0 8px 8px 0;
-  box-shadow: 0 2px 6px rgba(0,0,0,.06); }
-.dot { width:8px; height:8px; border-radius:50%; background:#22c55e; display:inline-block; }
-.steps { display:grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: .8rem; }
-.step { background: rgba(255,255,255,.6); border: 1px solid rgba(0,0,0,.06); border-radius: 18px;
-  padding: .9rem 1.1rem; }
-.step b.t { display:flex; align-items:center; gap:10px; font-size:.95rem; color:#0b1220; }
-.step .n { background:#ffe45c; border-radius:50%; width:26px; height:26px; display:inline-flex;
-  align-items:center; justify-content:center; font-weight:800; font-size:.8rem; }
-.step small { color:#6b7280; display:block; margin-top:.4rem; font-size:.78rem; }
+.hero{ display:grid; grid-template-columns: 1.5fr .6fr; gap:2rem; align-items:center; margin-bottom:1.6rem; }
+.hero img.logo{ width:min(430px,100%); display:block; border-radius:4px;
+  box-shadow:0 0 70px rgba(201,168,76,.28); }
+.logo-txt{ font-family:'Bebas Neue'; font-size:2.6rem; color:#ff9a3c; }
+.contactos{ display:flex; flex-direction:column; gap:10px; margin:14px 0 18px; align-items:flex-start; }
+.cchip{ display:inline-block; padding:.5rem .9rem; border-radius:8px; font-size:.85rem; font-weight:600;
+  text-decoration:none !important; border:1px solid; }
+.cchip.wa{ color:#4ade80 !important; border-color:rgba(74,222,128,.45); background:rgba(74,222,128,.08); }
+.cchip.ig{ color:#f472b6 !important; border-color:rgba(244,114,182,.45); background:rgba(244,114,182,.08); }
+.cchip.ml{ color:var(--gold2) !important; border-color:rgba(230,197,106,.45); background:rgba(230,197,106,.07); }
+.tagline{ display:inline-block; border:1px solid var(--line); border-radius:999px; padding:.3rem .9rem;
+  font-size:.7rem; letter-spacing:.18em; color:var(--gold); margin-bottom:.8rem; }
+.hero h1{ font-size:clamp(3rem, 7vw, 5.2rem); line-height:.92; margin:.2rem 0 1rem; color:#fff; }
+.hero h1 em{ color:var(--gold); font-style:normal; display:block; }
+.lead{ color:#c3cce0; font-size:1rem; line-height:1.7; max-width:560px; margin-bottom:1.3rem; }
+.stats{ display:flex; flex-direction:column; gap:14px; }
+.stat{ background:var(--card); border:1px solid rgba(120,140,220,.22); border-radius:14px; text-align:center; padding:1rem; }
+.stat b{ display:block; font-family:'Bebas Neue'; font-size:2.6rem; color:var(--gold); line-height:1; }
+.stat span{ font-size:.66rem; letter-spacing:.16em; color:var(--mut); text-transform:uppercase; }
 
-/* ---------- BUSCADOR (st.form) ---------- */
-[data-testid="stForm"] { background:#fff; border:1px solid #e7e5dc; border-radius: 24px;
-  padding: 1.1rem 1.3rem; box-shadow: 0 6px 20px rgba(0,0,0,.04); }
-[data-testid="stForm"] label p { font-weight: 800; font-size: 1.05rem; color:#0b1220; }
-[data-testid="stForm"] input { border-radius: 14px !important; background:#fff !important;
-  color:#0f172a !important; text-transform: uppercase; letter-spacing:.04em; }
-[data-testid="stForm"] [data-baseweb="input"] { border-radius: 14px; border:1px solid #d9d7cc;
-  background:#fff; }
-[data-testid="stFormSubmitButton"] button { background: linear-gradient(135deg,#5b8def,#8db4fa);
-  color:#fff; border:0; border-radius:16px; font-weight:600; height:3rem; width:100%; }
-[data-testid="stFormSubmitButton"] button:hover { filter: brightness(1.05); color:#fff; }
+/* ---------- SECCIONES ---------- */
+.sec-title{ font-family:'Bebas Neue'; font-size:2.2rem; color:#fff; margin:1.8rem 0 .2rem; }
+.sec-title em{ color:var(--gold); font-style:normal; }
+.sec-sub{ color:var(--mut); font-size:.9rem; margin-bottom:.9rem; }
+.chips{ display:flex; flex-wrap:wrap; gap:8px; margin:.4rem 0 1rem; }
+.chip{ display:inline-flex; align-items:center; gap:7px; background:var(--card2); border:1px solid rgba(255,255,255,.08);
+  border-radius:999px; padding:6px 13px; font-size:.78rem; color:#d6def0; }
+.chip i{ width:7px; height:7px; border-radius:50%; background:var(--gold); display:inline-block; }
+.chip.man i{ background:#64748b; }
+
+/* ---------- FORMULARIO ---------- */
+[data-testid="stForm"]{ background:var(--card); border:1px solid var(--line); border-radius:16px; padding:1.2rem 1.3rem; }
+[data-testid="stForm"] label p{ font-family:'Bebas Neue' !important; letter-spacing:.08em; font-size:1.25rem; color:var(--gold2); }
+[data-testid="stForm"] input{ text-transform:uppercase; letter-spacing:.08em; font-weight:600; }
+[data-baseweb="input"], [data-baseweb="base-input"], [data-baseweb="select"] > div{
+  background:#0b1329 !important; border-radius:10px !important; }
+[data-baseweb="input"], [data-baseweb="select"] > div{ border:1px solid rgba(201,168,76,.35) !important; }
+input{ color:#fff !important; }
+input::placeholder{ color:#6b7794 !important; text-transform:none; letter-spacing:0; font-weight:400; }
+[data-baseweb="popover"] ul, [data-baseweb="menu"]{ background:#0f1830 !important; }
+[data-testid="stFormSubmitButton"] button, .stButton button, .stDownloadButton button{
+  background:var(--gold); color:#0a1124 !important; border:0; border-radius:10px; font-weight:700; height:3rem; }
+[data-testid="stFormSubmitButton"] button:hover, .stButton button:hover, .stDownloadButton button:hover{
+  filter:brightness(1.08); color:#0a1124 !important; }
+[data-testid="stExpander"]{ background:var(--card); border:1px solid var(--line) !important; border-radius:12px; }
+[data-testid="stExpander"] summary p{ color:var(--txt); font-weight:600; }
 
 /* ---------- RESULTADOS ---------- */
-.jchip { display:inline-block; border-radius:999px; padding:8px 16px; font-weight:800;
-  font-size:.78rem; margin:0 8px 8px 0; text-transform:uppercase; box-shadow:0 3px 8px rgba(0,0,0,.08);
-  text-decoration:none !important; color:#111827 !important; }
-.card { background:#fff; border:1px solid #e7e5dc; border-radius:22px; padding:1.2rem 1.3rem;
-  margin-top:1rem; }
-.card h3 { font-weight:900; font-size:1.5rem; margin:0 0 .8rem 0; color:#0b1220; display:flex;
-  align-items:center; gap:10px; }
-.card h3 i { width:12px; height:12px; border-radius:50%; display:inline-block; }
-table.t { width:100%; border-collapse:collapse; font-size:.85rem; }
-table.t th { background:#efefef; color:#6b7280; font-size:.7rem; letter-spacing:.12em;
-  text-transform:uppercase; padding:.7rem; text-align:center; }
-table.t td { padding:.75rem; text-align:center; color:#111827; }
-table.t tr:nth-child(odd) td { background:#fffbe6; }
-.tag { display:inline-block; background:linear-gradient(135deg,#7c3aed,#5b21b6); color:#fff;
-  font-size:.62rem; font-weight:800; padding:4px 10px; border-radius:999px; margin-bottom:4px; }
-.warn { background:#fff7ed; border:1px solid #fed7aa; color:#9a3412; border-radius:14px;
-  padding:.8rem 1rem; font-size:.88rem; margin-top:1rem; }
-.ok { background:#f0fdf4; border:1px solid #bbf7d0; color:#166534; border-radius:14px;
-  padding:.8rem 1rem; font-size:.9rem; margin-top:1rem; }
-a.portal { color:#2563eb; font-weight:600; text-decoration:none; }
-.est { display:inline-block; border-radius:999px; padding:3px 10px; font-size:.72rem; font-weight:800; }
-.est.good { background:#dcfce7; color:#166534; }
-.est.bad  { background:#fee2e2; color:#991b1b; }
-.est.warn { background:#fef3c7; color:#92400e; }
-.est.neutral { background:#e5e7eb; color:#374151; }
+.res-head{ background:linear-gradient(135deg, rgba(201,168,76,.14), rgba(17,26,51,.9)); border:1px solid var(--line);
+  border-radius:18px; padding:1.5rem 1.6rem; margin-top:1.4rem; }
+.res-head h2{ font-size:2.8rem; line-height:.95; margin:0 0 .5rem; color:#fff; }
+.plate{ display:inline-block; font-family:'Bebas Neue'; font-size:1.8rem; letter-spacing:.14em; color:#0a1124;
+  background:var(--gold2); border-radius:8px; padding:.15rem .9rem; margin:.3rem 0 .9rem; }
+.kpis{ display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-top:.8rem; }
+.kpi{ background:rgba(8,14,31,.55); border:1px solid rgba(255,255,255,.08); border-radius:12px; padding:.8rem 1rem; }
+.kpi b{ display:block; font-family:'Bebas Neue'; font-size:1.9rem; color:var(--gold2); line-height:1.1; }
+.kpi span{ font-size:.66rem; letter-spacing:.14em; text-transform:uppercase; color:var(--mut); }
+.jchip{ display:inline-block; border-radius:999px; padding:7px 15px; font-weight:700; font-size:.76rem; margin:0 8px 8px 0;
+  text-transform:uppercase; text-decoration:none !important; border:1px solid; }
+.card{ background:var(--card); border:1px solid var(--line); border-radius:16px; padding:1.2rem 1.3rem; margin-top:1.1rem; }
+.card h3{ font-size:1.7rem; margin:0 0 .8rem; color:#fff; display:flex; align-items:center; gap:10px; }
+.card h3 i{ width:12px; height:12px; border-radius:50%; display:inline-block; }
+.card h3 small{ margin-left:auto; font-family:'DM Sans'; font-size:.9rem; color:var(--gold2); font-weight:700; }
+.tablewrap{ overflow-x:auto; }
+table.t{ width:100%; border-collapse:collapse; font-size:.85rem; }
+table.t th{ background:#0b1329; color:var(--mut); font-size:.68rem; letter-spacing:.14em; text-transform:uppercase;
+  padding:.7rem; text-align:center; }
+table.t td{ padding:.75rem; text-align:center; color:var(--txt); border-bottom:1px solid rgba(255,255,255,.05); }
+table.t tr:nth-child(even) td{ background:rgba(255,255,255,.025); }
+table.t td.l{ text-align:left; }
+.tag{ display:inline-block; background:linear-gradient(135deg,#7c3aed,#5b21b6); color:#fff; font-size:.6rem; font-weight:800;
+  padding:4px 10px; border-radius:999px; margin-bottom:4px; letter-spacing:.04em; }
+.warn{ background:rgba(251,146,60,.1); border:1px solid rgba(251,146,60,.4); color:#fdba74; border-radius:12px;
+  padding:.85rem 1rem; font-size:.9rem; margin-top:1rem; }
+.ok{ background:rgba(74,222,128,.1); border:1px solid rgba(74,222,128,.4); color:#86efac; border-radius:12px;
+  padding:.85rem 1rem; font-size:.92rem; margin-top:1rem; }
+a.portal{ color:var(--gold2) !important; font-weight:600; text-decoration:none; }
+.est{ display:inline-block; border-radius:999px; padding:3px 10px; font-size:.7rem; font-weight:800; }
+.est.good{ background:rgba(74,222,128,.15); color:#86efac; }
+.est.bad{ background:rgba(248,113,113,.15); color:#fca5a5; }
+.est.warn{ background:rgba(251,191,36,.15); color:#fcd34d; }
+.est.neutral{ background:rgba(148,163,184,.15); color:#cbd5e1; }
 
 /* Resumen flotante */
-.float { position:fixed; top:90px; right:24px; width:250px; background:#fffef8; z-index:50;
-  border-radius:22px; box-shadow:0 12px 40px rgba(0,0,0,.18); padding:1rem; border:1px solid #eee7c0; }
-.float .h { font-weight:800; font-size:1rem; padding-bottom:.6rem; border-bottom:1px solid #eee; }
-.float .s { font-size:.65rem; letter-spacing:.14em; color:#9ca3af; font-weight:800; margin:.7rem 0 .4rem; }
-.float .row { display:flex; justify-content:space-between; align-items:center; border-radius:14px;
-  padding:.5rem .7rem; margin-bottom:6px; font-weight:800; font-size:.8rem; }
-.float .row span.m { text-align:right; font-weight:500; font-size:.78rem; line-height:1.1; }
-.float .row span.m small { display:block; color:#6b7280; font-weight:700; font-size:.65rem; }
-.float .tot { border:1px solid #e5e7eb; border-radius:14px; text-align:center; padding:.6rem;
-  background:#fff; font-size:1rem; }
-.float .parcial { font-size:.65rem; color:#9a3412; font-weight:800; margin-top:.4rem; text-align:center; }
-@media (max-width: 1500px) { .float { position:static; width:auto; margin-top:1rem; } }
+.float{ position:fixed; top:90px; right:24px; width:250px; background:#0f1830; z-index:50; border-radius:18px;
+  box-shadow:0 14px 40px rgba(0,0,0,.55); padding:1rem; border:1px solid var(--line); }
+.float .h{ font-family:'Bebas Neue'; font-size:1.5rem; color:#fff; padding-bottom:.5rem; border-bottom:1px solid rgba(255,255,255,.08); }
+.float .s{ font-size:.62rem; letter-spacing:.16em; color:var(--mut); font-weight:700; margin:.7rem 0 .4rem; }
+.float .row{ display:flex; justify-content:space-between; align-items:center; border-radius:12px; padding:.5rem .7rem;
+  margin-bottom:6px; font-weight:700; font-size:.78rem; border:1px solid; }
+.float .row span.m{ text-align:right; font-weight:600; font-size:.78rem; line-height:1.1; color:#fff; }
+.float .row span.m small{ display:block; color:var(--mut); font-weight:600; font-size:.62rem; }
+.float .tot{ border:1px solid var(--line); border-radius:12px; text-align:center; padding:.6rem; background:#0b1329;
+  font-family:'Bebas Neue'; font-size:1.7rem; color:var(--gold2); }
+.float .parcial{ font-size:.62rem; color:#fdba74; font-weight:800; margin-top:.4rem; text-align:center; }
+@media (max-width:1500px){ .float{ position:static; width:auto; margin-top:1rem; } }
+
+/* ---------- PUBLICIDAD / CTA ---------- */
+.cta-box{ background:linear-gradient(135deg, rgba(201,168,76,.2), rgba(17,26,51,.95)); border:1px solid var(--gold);
+  border-radius:18px; padding:1.6rem; margin-top:1.4rem; text-align:center; }
+.cta-box h3{ font-size:2.2rem; color:#fff; margin:0 0 .3rem; }
+.cta-box p{ color:#c3cce0; margin:0 0 1rem; }
+.servicios{ display:grid; grid-template-columns:repeat(5,1fr); gap:10px; margin-top:.8rem; }
+.serv{ background:var(--card); border:1px solid var(--line); border-radius:12px; padding:.9rem .6rem; text-align:center;
+  font-size:.82rem; font-weight:600; color:#e8ecf5; }
+.foot{ border-top:1px solid rgba(255,255,255,.07); margin-top:2.2rem; padding-top:1.2rem; color:var(--mut);
+  font-size:.78rem; text-align:center; line-height:1.6; }
 
 /* ---------- OVERLAY DE CARGA ---------- */
-.ov { position:fixed; inset:0; background:rgba(120,125,135,.45); backdrop-filter: blur(6px);
-  z-index:9999; display:flex; align-items:center; justify-content:center; }
-.ovc { background:#fafaf6; width:min(560px,90vw); border-radius:28px; padding:1.6rem 1.8rem;
-  text-align:center; box-shadow:0 24px 60px rgba(0,0,0,.25); }
-.ovc .logo { width:52px; height:52px; border-radius:12px; background:#000; margin:0 auto .6rem;
+.ov{ position:fixed; inset:0; background:rgba(4,8,20,.7); backdrop-filter:blur(6px); z-index:9999;
   display:flex; align-items:center; justify-content:center; }
-.ovc .spin { width:28px; height:28px; border-radius:50%; border:4px solid #fff;
-  border-top-color:#facc15; animation: sp 1s linear infinite; }
-@keyframes sp { to { transform: rotate(360deg); } }
-.ovc h2 { font-weight:500; font-size:1.7rem; margin:.2rem 0; color:#111827; }
-.ovc .st { font-weight:800; color:#6b7280; font-size:.9rem; margin:.5rem 0 1rem; }
-.bar { height:12px; background:#e5e7eb; border-radius:99px; overflow:hidden; }
-.bar > div { height:100%; background:#facc15; border-radius:99px; transition: width .2s; }
-.ovc .tip { font-size:.72rem; color:#6b7280; font-weight:700; margin-top:1rem; }
+.ovc{ background:var(--card); border:1px solid var(--line); width:min(520px,90vw); border-radius:20px; padding:1.6rem 1.8rem;
+  text-align:center; box-shadow:0 24px 60px rgba(0,0,0,.6); }
+.ovc .spin{ width:44px; height:44px; border-radius:50%; border:4px solid rgba(255,255,255,.12); border-top-color:var(--gold);
+  animation:sp 1s linear infinite; margin:0 auto .6rem; }
+@keyframes sp{ to{ transform:rotate(360deg); } }
+.ovc h2{ font-size:2.2rem; margin:.1rem 0; color:#fff; }
+.ovc .st{ font-weight:600; color:var(--mut); font-size:.9rem; margin:.5rem 0 1rem; }
+.bar{ height:10px; background:rgba(255,255,255,.08); border-radius:99px; overflow:hidden; }
+.bar > div{ height:100%; background:var(--gold); border-radius:99px; transition:width .2s; }
+.ovc .tip{ font-size:.72rem; color:var(--mut); margin-top:1rem; }
 
-@media (max-width: 800px) { .hero h1 { font-size: 2.1rem; } .steps { grid-template-columns: 1fr; } }
+@media (max-width:900px){
+  .hero{ grid-template-columns:1fr; } .stats{ flex-direction:row; } .stat{ flex:1; padding:.7rem .3rem; }
+  .stat b{ font-size:1.8rem; } .kpis{ grid-template-columns:repeat(2,1fr); } .servicios{ grid-template-columns:repeat(2,1fr); }
+  .res-head h2{ font-size:2.2rem; }
+}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -241,7 +307,7 @@ class JurisdiccionConfig:
 
 
 # =============================================================================
-# 3. CLIENTE ANTI-CAPTCHA (CapSolver / 2Captcha)
+# 3. CLIENTE ANTI-CAPTCHA (CapSolver / 2Captcha: reCAPTCHA v2 + Imagen OCR)
 # =============================================================================
 class CaptchaSolver:
     def __init__(self, provider: str = "capsolver", api_key: str = ""):
@@ -252,46 +318,45 @@ class CaptchaSolver:
         if not self.api_key:
             raise CaptchaError("Falta la API Key del servicio de captcha (ver 'Opciones de desarrollo y Captcha').")
 
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=35) as client:
             if self.provider == "capsolver":
-                task = {
-                    "type": "ReCaptchaV2TaskProxyLess",
-                    "websiteURL": page_url,
-                    "websiteKey": site_key,
-                }
-                if invisible:
-                    task["isInvisible"] = True
-                r = await client.post("https://api.capsolver.com/createTask",
-                                      json={"clientKey": self.api_key, "task": task})
-                data = r.json()
-                if data.get("errorId", 0) != 0:
-                    raise CaptchaError(f"CapSolver: {data.get('errorCode')} - {data.get('errorDescription')}")
-                task_id = data["taskId"]
+                # Probamos primero v2 estándar y luego Enterprise si el portal lo requiere
+                for task_type in ("ReCaptchaV2TaskProxyLess", "ReCaptchaV2EnterpriseTaskProxyLess"):
+                    task = {"type": task_type, "websiteURL": page_url, "websiteKey": site_key}
+                    if invisible:
+                        task["isInvisible"] = True
+                    r = await client.post("https://api.capsolver.com/createTask",
+                                          json={"clientKey": self.api_key, "task": task})
+                    data = r.json()
+                    if data.get("errorId", 0) != 0:
+                        if task_type == "ReCaptchaV2EnterpriseTaskProxyLess":
+                            raise CaptchaError(f"CapSolver: {data.get('errorCode')} - {data.get('errorDescription')}")
+                        continue
+                    task_id = data["taskId"]
 
-                for _ in range(60):  # hasta ~2 min
-                    await asyncio.sleep(2)
-                    res = await client.post("https://api.capsolver.com/getTaskResult",
-                                            json={"clientKey": self.api_key, "taskId": task_id})
-                    rd = res.json()
-                    if rd.get("errorId", 0) != 0:
-                        raise CaptchaError(f"CapSolver: {rd.get('errorCode')} - {rd.get('errorDescription')}")
-                    if rd.get("status") == "ready":
-                        return rd["solution"]["gRecaptchaResponse"]
-                    if rd.get("status") == "failed":
-                        raise CaptchaError("CapSolver: la tarea falló")
+                    for _ in range(55):
+                        await asyncio.sleep(2)
+                        res = await client.post("https://api.capsolver.com/getTaskResult",
+                                                json={"clientKey": self.api_key, "taskId": task_id})
+                        rd = res.json()
+                        if rd.get("errorId", 0) != 0:
+                            break
+                        if rd.get("status") == "ready":
+                            return rd["solution"]["gRecaptchaResponse"]
+                        if rd.get("status") == "failed":
+                            break
+                raise CaptchaError("CapSolver no pudo resolver el reCAPTCHA del portal.")
             else:
-                params = {
-                    "key": self.api_key, "method": "userrecaptcha", "googlekey": site_key,
-                    "pageurl": page_url, "invisible": 1 if invisible else 0, "json": 1,
-                }
+                params = {"key": self.api_key, "method": "userrecaptcha", "googlekey": site_key,
+                          "pageurl": page_url, "invisible": 1 if invisible else 0, "json": 1}
                 r = await client.get("http://2captcha.com/in.php", params=params)
                 data = r.json()
                 if data.get("status") != 1:
                     raise CaptchaError(f"2Captcha: {data.get('request')}")
                 req_id = data["request"]
 
-                for _ in range(30):
-                    await asyncio.sleep(4)
+                for _ in range(35):
+                    await asyncio.sleep(3.5)
                     res = await client.get("http://2captcha.com/res.php",
                                            params={"key": self.api_key, "action": "get", "id": req_id, "json": 1})
                     rd = res.json()
@@ -302,9 +367,50 @@ class CaptchaSolver:
 
         raise CaptchaError("Tiempo agotado esperando la solución del captcha.")
 
+    async def solve_image_captcha(self, img_bytes: bytes) -> str:
+        """Resuelve CAPTCHAs de texto en imagen (ej. Santa Fe Provincial) usando CapSolver o 2Captcha."""
+        if not self.api_key:
+            raise CaptchaError("Falta la API Key del servicio de captcha.")
+        b64_img = base64.b64encode(img_bytes).decode()
+        async with httpx.AsyncClient(timeout=30) as client:
+            if self.provider == "capsolver":
+                r = await client.post(
+                    "https://api.capsolver.com/createTask",
+                    json={"clientKey": self.api_key, "task": {"type": "ImageToTextTask", "body": b64_img}},
+                )
+                data = r.json()
+                if data.get("errorId", 0) != 0:
+                    raise CaptchaError(f"CapSolver OCR: {data.get('errorDescription')}")
+                sol = data.get("solution", {})
+                if sol.get("text"):
+                    return sol["text"].strip()
+                task_id = data.get("taskId")
+                for _ in range(15):
+                    await asyncio.sleep(1.5)
+                    res = await client.post("https://api.capsolver.com/getTaskResult",
+                                            json={"clientKey": self.api_key, "taskId": task_id})
+                    rd = res.json()
+                    if rd.get("status") == "ready":
+                        return rd["solution"]["text"].strip()
+            else:
+                r = await client.post("http://2captcha.com/in.php",
+                                      data={"key": self.api_key, "method": "base64", "body": b64_img, "json": 1})
+                data = r.json()
+                if data.get("status") != 1:
+                    raise CaptchaError(f"2Captcha OCR: {data.get('request')}")
+                req_id = data["request"]
+                for _ in range(20):
+                    await asyncio.sleep(2.5)
+                    res = await client.get("http://2captcha.com/res.php",
+                                           params={"key": self.api_key, "action": "get", "id": req_id, "json": 1})
+                    rd = res.json()
+                    if rd.get("status") == 1:
+                        return rd["request"].strip()
+        raise CaptchaError("No se pudo decodificar el captcha de texto.")
+
 
 # =============================================================================
-# 4. PARSEO ROBUSTO (HTML + JSON)
+# 4. PARSEO ROBUSTO (HTML + JSON + PBA ESPECÍFICO)
 # =============================================================================
 RE_VACIO = re.compile(
     r"no registra|no posee|no se encontr|sin infracciones|sin deuda|libre de deuda|"
@@ -328,7 +434,6 @@ def limpiar_monto(texto) -> float | None:
     if not re.search(r"\d", limpio):
         return None
     if "," in limpio and "." in limpio:
-        # formato argentino 12.345,67  (o 12,345.67 si el último separador es el punto)
         if limpio.rfind(",") > limpio.rfind("."):
             limpio = limpio.replace(".", "").replace(",", ".")
         else:
@@ -336,7 +441,7 @@ def limpiar_monto(texto) -> float | None:
     elif "," in limpio:
         limpio = limpio.replace(",", ".")
     elif re.fullmatch(r"\d{1,3}(\.\d{3})+", limpio):
-        limpio = limpio.replace(".", "")  # 12.345 -> 12345
+        limpio = limpio.replace(".", "")
     try:
         return float(limpio)
     except ValueError:
@@ -356,10 +461,7 @@ def _tabla_a_infracciones(soup: BeautifulSoup) -> List[Infraccion]:
         for tr in table.find_all("tr"):
             celdas = tr.find_all(["th", "td"])
             textos = [c.get_text(" ", strip=True) for c in celdas]
-            es_encabezado = bool(tr.find("th")) or (
-                not tr.find("td") is None and False
-            )
-            if es_encabezado:
+            if tr.find("th"):
                 for i, h in enumerate(textos):
                     hl = h.lower()
                     if idx_monto is None and re.search(r"monto|importe|total|deuda|saldo|a pagar|valor", hl):
@@ -380,7 +482,7 @@ def _tabla_a_infracciones(soup: BeautifulSoup) -> List[Infraccion]:
             monto = None
             if idx_monto is not None and idx_monto < len(cols):
                 monto = limpiar_monto(cols[idx_monto])
-            if monto is None:  # buscar de derecha a izquierda una celda con importe
+            if monto is None:
                 for c in reversed(cols[1:]):
                     if re.search(r"\$|\d+[.,]\d{2}\b", c):
                         monto = limpiar_monto(c)
@@ -416,15 +518,51 @@ def _val(d: dict, patron: str):
 
 
 def _json_a_infracciones(data) -> tuple[List[Infraccion], bool]:
+    # Caso específico PBA (infraccionesba.gba.gob.ar/rest/consultar-infraccion)
+    if isinstance(data, dict) and "totalInfracciones" in data and isinstance(data.get("infracciones"), list):
+        if data.get("totalInfracciones", 0) == 0 or not data["infracciones"]:
+            return [], True
+        out_pba: List[Infraccion] = []
+        for item in data["infracciones"]:
+            if not isinstance(item, dict):
+                continue
+            acta = str(item.get("nroActa") or item.get("nroCausa") or item.get("id") or "S/N")
+            desc = ""
+            if isinstance(item.get("infracciones"), list) and item["infracciones"]:
+                sub = item["infracciones"][0]
+                if isinstance(sub, dict):
+                    art = sub.get("articulo", "")
+                    d_txt = sub.get("descripcion", "")
+                    desc = f"Art. {art} - {d_txt}".strip(" -") if art else d_txt
+            autoridad = item.get("autoridadAplicacion") or ""
+            if autoridad:
+                desc = f"{desc} ({autoridad})".strip()
+            estado_pub = ""
+            if isinstance(item.get("estadoCausaPublico"), dict):
+                estado_pub = str(item["estadoCausaPublico"].get("descripcion", ""))
+            monto = limpiar_monto(item.get("importeTotal") or item.get("importe"))
+            out_pba.append(Infraccion(
+                acta=acta[:30],
+                descripcion=(desc or "Infracción PBA")[:140],
+                monto=monto,
+                controlador=("juzgamiento" in estado_pub.lower() or "controlador" in desc.lower()),
+            ))
+        return out_pba, True
+
+    # Caso genérico para el resto de portales JSON
     listas: list = []
     vacias: list = []
     _listas_de_dicts(data, listas, vacias)
     out: List[Infraccion] = []
     for lista in listas:
         for d in lista:
-            acta = _val(d, r"acta|nro|numero|n[uú]m|comprobante|expediente|^id$")
-            monto = _val(d, r"monto|importe|total|deuda|saldo|valor")
+            acta = _val(d, r"nroActa|nroCausa|acta|nro|numero|n[uú]m|comprobante|expediente|^id$")
+            monto = _val(d, r"importeTotal|monto|importe|total|deuda|saldo|valor")
             desc = _val(d, r"descrip|infracci|falta|motivo|concepto")
+            if not desc and isinstance(d.get("infracciones"), list) and d["infracciones"]:
+                primera = d["infracciones"][0]
+                if isinstance(primera, dict):
+                    desc = primera.get("descripcion")
             if acta is None or monto is None:
                 continue
             out.append(Infraccion(
@@ -456,13 +594,17 @@ def interpretar_respuesta(resp: httpx.Response) -> RespuestaPortal:
         extra = " (posible bloqueo por IP extranjera / WAF)" if resp.status_code in (403, 429) else ""
         raise ConsultaIndeterminada(f"HTTP {resp.status_code}{extra}", resp.status_code, muestra)
 
-    # --- JSON ---
     if "json" in ctype or cuerpo.lstrip().startswith(("{", "[")):
         try:
             data = resp.json()
         except ValueError:
             data = None
         if data is not None:
+            if isinstance(data, dict) and data.get("error") is True:
+                msg_err = str(data.get("mensaje") or data.get("message") or "Error devuelto por la API del portal")
+                if RE_CAPTCHA_MAL.search(msg_err):
+                    raise CaptchaError(msg_err)
+                raise ConsultaIndeterminada(msg_err, resp.status_code, muestra)
             items, hay_lista_vacia = _json_a_infracciones(data)
             if items:
                 return RespuestaPortal(_dedup(items), resp.status_code, muestra)
@@ -470,26 +612,24 @@ def interpretar_respuesta(resp: httpx.Response) -> RespuestaPortal:
                 return RespuestaPortal([], resp.status_code, muestra)
             raise ConsultaIndeterminada("JSON sin estructura de infracciones reconocible", resp.status_code, muestra)
 
-    # --- HTML ---
-    soup = BeautifulSoup(cuerpo, "html.parser")
     items = _tabla_a_infracciones(BeautifulSoup(cuerpo, "html.parser"))
     if items:
         return RespuestaPortal(_dedup(items), resp.status_code, muestra)
 
-    visible = texto_visible(soup)
+    visible = texto_visible(BeautifulSoup(cuerpo, "html.parser"))
     muestra = visible[:800] or muestra
     if RE_CAPTCHA_MAL.search(visible):
         raise CaptchaError("El portal rechazó el token del captcha")
     if RE_VACIO.search(visible):
         return RespuestaPortal([], resp.status_code, muestra)
     raise ConsultaIndeterminada(
-        "Respuesta sin tabla de infracciones ni mensaje de 'sin infracciones' (¿cambió el portal?)",
+        "Respuesta sin tabla de infracciones ni mensaje de 'sin infracciones'",
         resp.status_code, muestra,
     )
 
 
 # =============================================================================
-# 5. CONECTORES HTTP
+# 5. CONECTORES HTTP (FORMULARIOS + APIs SPA DEDICADAS)
 # =============================================================================
 def nuevo_cliente(timeout: int = 40) -> httpx.AsyncClient:
     return httpx.AsyncClient(verify=False, follow_redirects=True, timeout=timeout, headers=HEADERS_HTTP)
@@ -499,12 +639,12 @@ RE_CAMPO_PATENTE = re.compile(r"domin|patent|vehic|plac", re.I)
 RE_SITEKEY = [
     r'data-sitekey=["\']([0-9A-Za-z_-]{40})["\']',
     r'sitekey["\']?\s*[:=]\s*["\']([0-9A-Za-z_-]{40})["\']',
+    r'siteKey["\']?\s*[:=]\s*["\']([0-9A-Za-z_-]{40})["\']',
     r'recaptcha/(?:api|enterprise)\.js\?[^"\']*render=([0-9A-Za-z_-]{40})',
     r'[?&]k=([0-9A-Za-z_-]{40})',
     r'["\'](6L[0-9A-Za-z_-]{38})["\']',
 ]
 
-# Si conocés el sitekey de algún portal, cargalo acá y se evita buscarlo.
 SITEKEYS_CONOCIDAS: dict[str, str] = {}
 
 
@@ -517,7 +657,6 @@ def _buscar_sitekey_en_texto(texto: str) -> str | None:
 
 
 async def buscar_sitekey(client: httpx.AsyncClient, url: str, html_text: str) -> str | None:
-    """Busca el sitekey en el HTML y, si no está, dentro de los .js del portal (SPAs)."""
     for dominio, key in SITEKEYS_CONOCIDAS.items():
         if dominio in url:
             return key
@@ -526,13 +665,23 @@ async def buscar_sitekey(client: httpx.AsyncClient, url: str, html_text: str) ->
         return key
     soup = BeautifulSoup(html_text, "html.parser")
     scripts = [urljoin(url, s["src"]) for s in soup.find_all("script", src=True)]
-    scripts = [s for s in scripts if "google.com" not in s and "gstatic.com" not in s][:8]
+    scripts = [s for s in scripts if "google.com" not in s and "gstatic.com" not in s][:10]
     for s in scripts:
         try:
             r = await client.get(s)
             key = _buscar_sitekey_en_texto(r.text)
             if key:
                 return key
+            # Buscar también en sub-chunks JS de Angular/Webpack
+            for m in re.findall(r'["\']([\w\-./]{3,60}\.js)["\']', r.text)[:6]:
+                if not m.startswith("http") and "node_modules" not in m:
+                    try:
+                        rc = await client.get(urljoin(s, m))
+                        key = _buscar_sitekey_en_texto(rc.text)
+                        if key:
+                            return key
+                    except httpx.HTTPError:
+                        continue
         except httpx.HTTPError:
             continue
     return None
@@ -542,22 +691,67 @@ def _es_input_texto(tag) -> bool:
     return tag.name == "input" and (tag.get("type") or "text").lower() in ("text", "search")
 
 
+def serializar_form(scope) -> dict:
+    datos: dict = {}
+    for el in scope.find_all(["input", "select", "textarea"]):
+        nombre = el.get("name")
+        if not nombre:
+            continue
+        if el.name == "input":
+            t = (el.get("type") or "text").lower()
+            if t in ("submit", "button", "image", "reset", "file"):
+                continue
+            if t in ("checkbox", "radio"):
+                if el.has_attr("checked"):
+                    datos[nombre] = el.get("value", "on")
+                continue
+            datos[nombre] = el.get("value", "")
+        elif el.name == "select":
+            opt = el.find("option", selected=True) or el.find("option")
+            datos[nombre] = (opt.get("value", opt.get_text(strip=True)) if opt else "")
+        else:
+            datos[nombre] = el.get_text()
+    return datos
+
+
+def _elegir_boton(scope):
+    botones = scope.find_all(
+        lambda t: (t.name == "input" and (t.get("type") or "").lower() in ("submit", "image"))
+        or (t.name == "button" and (t.get("type") or "submit").lower() == "submit")
+    )
+    if not botones:
+        return None
+
+    def afinidad(b) -> int:
+        txt = (str(b.get("name", "")) + str(b.get("id", "")) + str(b.get("value", "")) + b.get_text()).lower()
+        if re.search(r"domin|patent", txt):
+            return 2
+        if re.search(r"dni|cuit|cuil|direcc|document|causa|limpiar|volver", txt):
+            return 0
+        return 1
+
+    return max(botones, key=afinidad)
+
+
 def preparar_form(soup: BeautifulSoup, base_url: str, patente: str):
-    """Devuelve (metodo, url_destino, datos) del formulario que contiene el campo patente."""
     campos = soup.find_all(_es_input_texto)
     campo = next((c for c in campos if RE_CAMPO_PATENTE.search((c.get("name") or "") + " " + (c.get("id") or ""))), None)
     campo = campo or (campos[0] if campos else None)
     if campo is None or not campo.get("name"):
         raise ConsultaIndeterminada(
-            "No hay formulario con campo de patente en el HTML (portal SPA/JS: requiere conocer su API)."
+            "No hay formulario con campo de patente en el HTML (portal SPA/JS)."
         )
     form = campo.find_parent("form")
     scope = form or soup
-    datos = {i["name"]: i.get("value", "") for i in scope.find_all("input", {"type": "hidden"}) if i.get("name")}
+    datos = serializar_form(scope)
     datos[campo["name"]] = patente
-    btn = scope.find("input", {"type": "submit"}) or scope.find("button", {"type": "submit"})
+    btn = _elegir_boton(scope)
     if btn is not None and btn.get("name"):
-        datos[btn["name"]] = btn.get("value", "") or "Consultar"
+        if (btn.get("type") or "").lower() == "image":
+            datos[btn["name"] + ".x"] = "1"
+            datos[btn["name"] + ".y"] = "1"
+        else:
+            datos[btn["name"]] = btn.get("value", "") or "Consultar"
     metodo = ((form.get("method") if form else None) or "post").lower()
     destino = urljoin(base_url, form["action"]) if (form and form.get("action")) else base_url
     return metodo, destino, datos
@@ -565,13 +759,13 @@ def preparar_form(soup: BeautifulSoup, base_url: str, patente: str):
 
 async def http_formulario(url: str, patente: str, solver: CaptchaSolver | None = None,
                           invisible: bool = False) -> RespuestaPortal:
-    """Conector genérico: GET del formulario → (captcha) → envío → interpretación."""
+    """Conector clásico para portales con <form> HTML (Posadas, Rosario, Lomas de Zamora)."""
     async with nuevo_cliente(45) as client:
         r_get = await client.get(url)
         if r_get.status_code >= 400:
-            interpretar_respuesta(r_get)  # lanza el error con detalle
+            interpretar_respuesta(r_get)
         soup = BeautifulSoup(r_get.text, "html.parser")
-        metodo, destino, datos = preparar_form(soup, str(r_get.url), patente)  # valida ANTES de gastar captcha
+        metodo, destino, datos = preparar_form(soup, str(r_get.url), patente)
 
         if solver is not None:
             sitekey = await buscar_sitekey(client, str(r_get.url), r_get.text)
@@ -579,13 +773,304 @@ async def http_formulario(url: str, patente: str, solver: CaptchaSolver | None =
                 raise ConsultaIndeterminada("No se encontró el sitekey de reCAPTCHA en el portal.",
                                             r_get.status_code, re.sub(r"\s+", " ", r_get.text)[:400])
             token = await solver.solve_recaptcha_v2(sitekey, str(r_get.url), invisible=invisible)
-            datos["g-recaptcha-response"] = token  # se usa de inmediato (dura ~2 min, un solo uso)
+            datos["g-recaptcha-response"] = token
 
         if metodo == "get":
             r_post = await client.get(destino, params=datos)
         else:
             r_post = await client.post(destino, data=datos, headers={"Referer": str(r_get.url)})
         return interpretar_respuesta(r_post)
+
+
+# --- CONECTOR DEDICADO 1: PBA (InfraccionesBA REST API) ----------------------
+async def http_pba_api(patente: str, solver: CaptchaSolver) -> RespuestaPortal:
+    """Conecta directo al endpoint REST de PBA: /rest/consultar-infraccion."""
+    url_web = "https://infraccionesba.gba.gob.ar/consulta-infraccion"
+    url_api = "https://infraccionesba.gba.gob.ar/rest/consultar-infraccion"
+    async with nuevo_cliente(50) as client:
+        r_get = await client.get(url_web)
+        if r_get.status_code >= 400:
+            return interpretar_respuesta(r_get)
+        sitekey = await buscar_sitekey(client, str(r_get.url), r_get.text)
+        if not sitekey:
+            raise ConsultaIndeterminada("No se pudo extraer el sitekey de PBA.", r_get.status_code)
+        token = await solver.solve_recaptcha_v2(sitekey, url_web, invisible=False)
+        params = {
+            "dominio": patente,
+            "reCaptcha": token,
+            "cantPorPagina": 10,
+            "paginaActual": 1,
+        }
+        r_api = await client.get(
+            url_api,
+            params=params,
+            headers={"Referer": url_web, "Accept": "application/json, text/plain, */*"},
+        )
+        return interpretar_respuesta(r_api)
+
+
+# --- CONECTOR DEDICADO 2: EZEIZA (Infratrack Vue/AJAX) -----------------------
+async def http_ezeiza_api(patente: str, solver: CaptchaSolver) -> RespuestaPortal:
+    url_web = "https://consulta-web.infratrack.com.ar/consultas.php?municipio=ezeiza"
+    async with nuevo_cliente(50) as client:
+        r_get = await client.get(url_web)
+        if r_get.status_code >= 400:
+            return interpretar_respuesta(r_get)
+        sitekey = await buscar_sitekey(client, str(r_get.url), r_get.text)
+
+        # Buscamos dinámicamente en los scripts de Infratrack el archivo PHP/API al que hace POST/GET
+        soup = BeautifulSoup(r_get.text, "html.parser")
+        endpoints_js: list[str] = []
+        for s in soup.find_all("script", src=True):
+            src_url = urljoin(str(r_get.url), s["src"])
+            if "google" in src_url or "jquery" in src_url or "bootstrap" in src_url:
+                continue
+            try:
+                rs = await client.get(src_url)
+                if not sitekey:
+                    sitekey = _buscar_sitekey_en_texto(rs.text)
+                for m in re.findall(r'["\']([A-Za-z0-9_\-./]+\.php(?:\?[^"\']*)?)["\']', rs.text):
+                    full_ep = urljoin(str(r_get.url), m)
+                    if full_ep not in endpoints_js and "consultas.php" not in m:
+                        endpoints_js.append(full_ep)
+            except httpx.HTTPError:
+                continue
+
+        token = await solver.solve_recaptcha_v2(sitekey, url_web) if sitekey else ""
+        candidatos = endpoints_js + [
+            "https://consulta-web.infratrack.com.ar/ajax/consultas.php",
+            "https://consulta-web.infratrack.com.ar/api/consultas.php",
+            url_web,
+        ]
+        payload = {
+            "municipio": "ezeiza",
+            "dominio": patente,
+            "patente": patente,
+            "tipo": "dominio",
+            "g-recaptcha-response": token,
+            "recaptcha": token,
+        }
+        ultimo_resp = r_get
+        for ep in candidatos[:5]:
+            r_post = await client.post(ep, data=payload, headers={"Referer": url_web, "X-Requested-With": "XMLHttpRequest"})
+            ultimo_resp = r_post
+            if "json" in r_post.headers.get("content-type", "").lower() or r_post.text.lstrip().startswith(("{", "[")):
+                return interpretar_respuesta(r_post)
+        return interpretar_respuesta(ultimo_resp)
+
+
+# --- CONECTOR DEDICADO 3: ENTRE RÍOS Y MISIONES (Monitoreo Vial SPA) ---------
+async def http_monitoreo_vial_api(url_base: str, patente: str, solver: CaptchaSolver) -> RespuestaPortal:
+    async with nuevo_cliente(50) as client:
+        r_get = await client.get(url_base)
+        if r_get.status_code >= 400:
+            return interpretar_respuesta(r_get)
+
+        # Descubrimos sitekey y URL del backend leyendo el bundle JS de Monitoreo Vial
+        sitekey = await buscar_sitekey(client, str(r_get.url), r_get.text)
+        soup = BeautifulSoup(r_get.text, "html.parser")
+        scripts = [urljoin(str(r_get.url), s["src"]) for s in soup.find_all("script", src=True) if not RE_LIBS.search(s["src"])]
+        api_candidatas: list[str] = []
+        for s in scripts[:8]:
+            try:
+                rs = await client.get(s)
+                for m in RE_CONFIG_JS.findall(rs.text):
+                    if m.startswith("http") or m.startswith("/"):
+                        api_candidatas.append(urljoin(str(r_get.url), m))
+                for m in RE_URL_JS.findall(rs.text):
+                    if re.search(r"infraccion|consulta|dominio|acta", m, re.I) and not RE_IGNORAR.search(m):
+                        api_candidatas.append(urljoin(str(r_get.url), m))
+            except httpx.HTTPError:
+                continue
+
+        token = await solver.solve_recaptcha_v2(sitekey, url_base) if sitekey else ""
+        rutas_prueba = api_candidatas[:6] + [
+            urljoin(url_base, "rest/consultar-infraccion"),
+            urljoin(url_base, "api/infracciones/consulta"),
+            urljoin(url_base, "api/consulta"),
+            urljoin(url_base, "api/infracciones"),
+        ]
+        ultimo_r = r_get
+        for ep in rutas_prueba:
+            try:
+                r_api = await client.get(
+                    ep,
+                    params={"dominio": patente, "patente": patente, "reCaptcha": token, "recaptcha": token, "cantPorPagina": 10, "paginaActual": 1},
+                    headers={"Referer": url_base, "Accept": "application/json, text/plain, */*"},
+                )
+                ultimo_r = r_api
+                if r_api.status_code == 200 and ("json" in r_api.headers.get("content-type", "").lower() or r_api.text.lstrip().startswith(("{", "["))):
+                    return interpretar_respuesta(r_api)
+            except httpx.HTTPError:
+                continue
+        return interpretar_respuesta(ultimo_r)
+
+
+# --- CONECTOR DEDICADO 4: CABA (GCBA Actas de Tránsito) ----------------------
+async def http_caba_api(patente: str, solver: CaptchaSolver) -> RespuestaPortal:
+    url_web = "https://buenosaires.gob.ar/licenciasdeconducir/consulta-de-infracciones/?actas=transito"
+    async with nuevo_cliente(50) as client:
+        r_get = await client.get(url_web)
+        if r_get.status_code >= 400:
+            return interpretar_respuesta(r_get)
+        sitekey = await buscar_sitekey(client, str(r_get.url), r_get.text)
+        token = await solver.solve_recaptcha_v2(sitekey, str(r_get.url)) if sitekey else ""
+
+        soup = BeautifulSoup(r_get.text, "html.parser")
+        datos = serializar_form(soup)
+        datos.update({
+            "dominio": patente,
+            "patente": patente,
+            "tipo": "dominio",
+            "g-recaptcha-response": token,
+        })
+        form = soup.find("form")
+        destino = urljoin(str(r_get.url), form["action"]) if (form and form.get("action")) else str(r_get.url)
+        r_post = await client.post(destino, data=datos, headers={"Referer": str(r_get.url)})
+        return interpretar_respuesta(r_post)
+
+
+# --- CONECTOR DEDICADO 5: SANTA FE PROVINCIAL (CAPTCHA de Imagen + OCR) ------
+async def http_santafe_ocr(patente: str, solver: CaptchaSolver) -> RespuestaPortal:
+    url_inicio = "https://www.santafe.gov.ar/juzgadovirtual/consultaInfraccion.do?method=inicio"
+    url_busq = "https://www.santafe.gov.ar/juzgadovirtual/consultaInfraccion.do?method=BusquedaVehiculo"
+    async with nuevo_cliente(45) as client:
+        r_get = await client.get(url_inicio)
+        if r_get.status_code >= 400:
+            return interpretar_respuesta(r_get)
+        soup = BeautifulSoup(r_get.text, "html.parser")
+        datos = serializar_form(soup)
+
+        # Buscamos la imagen del captcha en el HTML de Santa Fe
+        img_tag = soup.find("img", src=re.compile(r"captcha|jcaptcha|imagen|image", re.I))
+        if img_tag and img_tag.get("src"):
+            img_url = urljoin(str(r_get.url), img_tag["src"])
+            r_img = await client.get(img_url, headers={"Referer": str(r_get.url)})
+            if r_img.status_code == 200 and r_img.content:
+                texto_ocr = await solver.solve_image_captcha(r_img.content)
+                for k in list(datos.keys()):
+                    if re.search(r"captcha|codigo|verif", k, re.I):
+                        datos[k] = texto_ocr
+                datos.setdefault("captcha", texto_ocr)
+
+        for k in list(datos.keys()):
+            if RE_CAMPO_PATENTE.search(k):
+                datos[k] = patente
+        datos.setdefault("dominio", patente)
+
+        r_post = await client.post(url_busq, data=datos, headers={"Referer": str(r_get.url)})
+        return interpretar_respuesta(r_post)
+
+
+# =============================================================================
+# 5b. EXPLORADOR DE PORTALES (diagnóstico para conectar portales SPA)
+# =============================================================================
+RE_URL_JS = re.compile(
+    r"""["'`]((?:https?:)?//[^"'`\s<>]{6,200}|/[A-Za-z0-9_\-./]{2,120}(?:\?[^"'`\s<>]{0,80})?)["'`]"""
+)
+RE_PALABRAS_API = re.compile(r"api|rest|consult|infraccion|dominio|patente|multa|acta|captcha|buscar|search|token|scoring", re.I)
+RE_IGNORAR = re.compile(
+    r"\.(png|jpe?g|gif|svg|css|woff2?|ttf|ico|map|webp|html)(\?|$)|w3\.org|googleapis|gstatic|schema\.org|"
+    r"googletagmanager|facebook|twitter|youtube|mozilla|github|angular\.io|reactjs|npmjs|momentjs|ngsw",
+    re.I,
+)
+RE_CONFIG_JS = re.compile(
+    r"""(?:baseURL|baseUrl|apiUrl|API_URL|apiBase|apiEndpoint|backend|endpoint|serverUrl)["']?\s*[:=]\s*["'`]([^"'`]{4,200})["'`]""",
+    re.I,
+)
+RE_LIBS = re.compile(r"google|gstatic|googletagmanager|facebook|cloudflareinsights|jquery|bootstrap|fontawesome", re.I)
+
+
+async def explorar_portal(nombre: str, url: str) -> dict:
+    url = url.split("#")[0]
+    info: dict = {"portal": nombre, "url": url}
+    try:
+        async with nuevo_cliente(30) as c:
+            r = await c.get(url)
+            info.update(http=r.status_code, url_final=str(r.url), bytes=len(r.content),
+                        content_type=r.headers.get("content-type", "")[:60])
+            soup = BeautifulSoup(r.text, "html.parser")
+            info["titulo"] = (soup.title.get_text(strip=True) if soup.title else "")[:120]
+            info["formularios"] = [
+                {
+                    "method": f.get("method", "get"),
+                    "action": f.get("action", ""),
+                    "campos": [
+                        {"name": i.get("name"), "type": i.get("type", i.name), "id": i.get("id")}
+                        for i in f.find_all(["input", "select", "textarea"])
+                    ][:25],
+                }
+                for f in soup.find_all("form")[:6]
+            ]
+            info["inputs_en_pagina"] = len(soup.find_all("input"))
+            info["texto_inicial"] = texto_visible(BeautifulSoup(r.text, "html.parser"))[:300]
+
+            scripts = [urljoin(str(r.url), s["src"]) for s in soup.find_all("script", src=True)]
+            scripts = [s for s in scripts if not RE_LIBS.search(s)]
+            info["scripts"] = scripts[:15]
+
+            textos: list[tuple[str, str]] = [(str(r.url), r.text)]
+            for s in scripts[:10]:
+                try:
+                    rs = await c.get(s)
+                    if rs.status_code == 200:
+                        textos.append((s, rs.text[:3_000_000]))
+                except httpx.HTTPError:
+                    continue
+
+            vistos = {s for s, _ in textos}
+            chunks: list[str] = []
+            for s, t in list(textos[1:]):
+                for m in re.findall(r'["\']([\w\-./]{3,80}\.js)["\']', t):
+                    if m.startswith("http") or "node_modules" in m:
+                        continue
+                    u = urljoin(s, m)
+                    if u not in vistos and u not in chunks and not RE_LIBS.search(u):
+                        chunks.append(u)
+            for u in chunks[:10]:
+                try:
+                    rs = await c.get(u)
+                    if rs.status_code == 200:
+                        textos.append((u, rs.text[:3_000_000]))
+                except httpx.HTTPError:
+                    continue
+
+            endpoints: list[str] = []
+            sitekeys: set[str] = set()
+            configs: list[str] = []
+            for _, t in textos:
+                for m in RE_URL_JS.findall(t):
+                    if RE_PALABRAS_API.search(m) and not RE_IGNORAR.search(m) and m not in endpoints:
+                        endpoints.append(m)
+                for p in RE_SITEKEY:
+                    for k in re.findall(p, t):
+                        sitekeys.add(k)
+                for m in RE_CONFIG_JS.findall(t):
+                    if m not in configs:
+                        configs.append(m)
+            info["js_analizados"] = len(textos) - 1
+            info["sitekeys"] = sorted(sitekeys)[:6]
+            info["config_urls"] = configs[:20]
+            info["endpoints_candidatos"] = endpoints[:60]
+    except Exception as exc:  # noqa: BLE001
+        info["error"] = f"{type(exc).__name__}: {exc}"
+    return info
+
+
+async def explorar_todos() -> dict:
+    ip: dict = {}
+    try:
+        async with nuevo_cliente(15) as c:
+            ip = (await c.get("https://ipinfo.io/json")).json()
+    except Exception as exc:  # noqa: BLE001
+        ip = {"error": str(exc)}
+    objetivos = [(j.nombre, j.url) for j in JURISDICCIONES if j.consultar is not None]
+    informes = await asyncio.gather(*(explorar_portal(n, u) for n, u in objetivos))
+    return {
+        "ip_de_salida": {k: ip.get(k) for k in ("ip", "country", "region", "city", "org", "error")},
+        "generado": datetime.now(TZ_AR).isoformat(timespec="seconds"),
+        "portales": list(informes),
+    }
 
 
 # =============================================================================
@@ -600,6 +1085,7 @@ URL_EZEIZA = "https://consulta-web.infratrack.com.ar/consultas.php?municipio=eze
 URL_ER = "https://monitoreovialentrerios.info/"
 URL_MISIONES = "https://monitoreovialmisiones.info/"
 URL_LANUS = "https://tramitesweb.lanus.gob.ar/lanusdigital/mis-dominios"
+URL_SANTAFE = "https://www.santafe.gov.ar/juzgadovirtual/consultaInfraccion.do?method=inicio"
 
 JURISDICCIONES: List[JurisdiccionConfig] = [
     JurisdiccionConfig("Posadas (Misiones)", "Sin CAPTCHA", URL_POSADAS,
@@ -609,31 +1095,27 @@ JURISDICCIONES: List[JurisdiccionConfig] = [
     JurisdiccionConfig("Lomas de Zamora", "Sin CAPTCHA", URL_LOMAS,
                        lambda p, s: http_formulario(URL_LOMAS, p)),
     JurisdiccionConfig("PBA", "reCAPTCHA", URL_PBA,
-                       lambda p, s: http_formulario(URL_PBA, p, s, invisible=True)),
+                       lambda p, s: http_pba_api(p, s)),
     JurisdiccionConfig("CABA", "reCAPTCHA", URL_CABA,
-                       lambda p, s: http_formulario(URL_CABA, p, s)),
+                       lambda p, s: http_caba_api(p, s)),
     JurisdiccionConfig("Ezeiza", "reCAPTCHA", URL_EZEIZA,
-                       lambda p, s: http_formulario(URL_EZEIZA, p, s)),
+                       lambda p, s: http_ezeiza_api(p, s)),
     JurisdiccionConfig("Entre Ríos", "reCAPTCHA", "https://monitoreovialentrerios.info/#/consulta-infracciones",
-                       lambda p, s: http_formulario(URL_ER, p, s)),
+                       lambda p, s: http_monitoreo_vial_api(URL_ER, p, s)),
     JurisdiccionConfig("Misiones", "reCAPTCHA", "https://monitoreovialmisiones.info/#/",
-                       lambda p, s: http_formulario(URL_MISIONES, p, s)),
-    JurisdiccionConfig("Lanús", "reCAPTCHA", URL_LANUS,
-                       lambda p, s: http_formulario(URL_LANUS, p, s)),
+                       lambda p, s: http_monitoreo_vial_api(URL_MISIONES, p, s)),
+    JurisdiccionConfig("Santa Fe", "CAPTCHA Texto", URL_SANTAFE,
+                       lambda p, s: http_santafe_ocr(p, s)),
+    JurisdiccionConfig("Lanús", "reCAPTCHA", URL_LANUS),
     JurisdiccionConfig("Córdoba Caminera", "Sin CAPTCHA", "https://www.rentascordoba.gob.ar/emision/ver-y-pagar/caminera"),
-    JurisdiccionConfig("Santa Fe", "CAPTCHA Texto", "https://www.santafe.gov.ar/juzgadovirtual/consultaInfraccion.do?method=BusquedaVehiculo"),
     JurisdiccionConfig("Vicente López", "Cloudflare", "https://infracciones.vicentelopez.gov.ar/causas-vecino"),
     JurisdiccionConfig("Avellaneda", "Cloudflare", "https://multas.mda.gob.ar"),
 ]
 
-PALETA = [
-    ("#ffdf5c", "#f5c400"), ("#a5d8ff", "#3b9cf0"), ("#d4c1ff", "#9b7bf0"),
-    ("#b9f0cf", "#34c776"), ("#ffd0c2", "#f4724e"), ("#ffc9e3", "#e8559f"),
-    ("#c7f0f0", "#2cb5b5"), ("#e6dcc8", "#a58d62"),
-]
+PALETA = ["#e6c56a", "#6cb6ff", "#b79bff", "#5fd8a0", "#ff9a7a", "#ff8fc4", "#5fd6d6", "#d4b98a"]
 
 
-def color_de(nombre: str) -> tuple[str, str]:
+def color_de(nombre: str) -> str:
     idx = [j.nombre for j in JURISDICCIONES].index(nombre) % len(PALETA)
     return PALETA[idx]
 
@@ -659,13 +1141,8 @@ def _demo_infracciones(patente: str, nombre: str) -> List[Infraccion]:
     rnd = random.Random(f"{patente}-{nombre}")
     if rnd.random() < 0.45:
         return []
-    textos = [
-        "Circular por zona/carril prohibido",
-        "Estac. lugar sin ticket/hora vencida",
-        "No uso cinturón de seguridad",
-        "Exceso de velocidad",
-        "Cruzar semáforo en rojo",
-    ]
+    textos = ["Circular por zona/carril prohibido", "Estac. lugar sin ticket/hora vencida",
+              "No uso cinturón de seguridad", "Exceso de velocidad", "Cruzar semáforo en rojo"]
     return [
         Infraccion(
             acta=f"{rnd.choice('QIAF')}{rnd.randint(10_000_000, 99_999_999)}",
@@ -694,7 +1171,7 @@ async def _consultar_una(cfg: JurisdiccionConfig, patente: str, demo: bool, solv
 
     try:
         resp: RespuestaPortal | None = None
-        for intento in (1, 2):  # un reintento solo ante fallos de red (no gasta captcha extra)
+        for intento in (1, 2):
             try:
                 resp = await asyncio.wait_for(cfg.consultar(patente, solver), timeout=150)
                 break
@@ -732,269 +1209,15 @@ async def ejecutar_consultas(patente, lista, demo, solver, on_progress) -> List[
 
 
 def resumen_json(patente: str, resultados: List[ResultadoJurisdiccion]) -> dict:
+    """Mismo orden que el panel de resumen: primero las jurisdicciones con multas."""
     fallos = [r.nombre for r in resultados if r.estado in ESTADOS_FALLO]
     manuales = [r.nombre for r in resultados if r.estado == "sin_conector"]
     todas = [i for r in resultados for i in r.infracciones]
+    total = round(sum(r.subtotal for r in resultados), 2)
+    ordenados = sorted(resultados, key=lambda r: (r.estado != "con_multas", -r.subtotal))
     return {
         "patente": patente,
         "consultado_en": datetime.now(TZ_AR).isoformat(timespec="seconds"),
-        "completo": not fallos,
-        "total_infracciones": len(todas),
-        "total_general": round(sum(r.subtotal for r in resultados), 2),
-        "portales_con_fallo": fallos,
-        "portales_consulta_manual": manuales,
-        "jurisdicciones": [
-            {
-                "nombre": r.nombre,
-                "estado": r.estado,
-                "detalle": r.detalle,
-                "cantidad": len(r.infracciones),
-                "subtotal": round(r.subtotal, 2),
-                "url": r.url,
-                "infracciones": [
-                    {"acta": i.acta, "descripcion": i.descripcion, "monto": i.monto, "con_controlador": i.controlador}
-                    for i in r.infracciones
-                ],
-            }
-            for r in resultados
-        ],
-    }
-
-
-def overlay(pct: int, estado: str) -> str:
-    return (
-        '<div class="ov"><div class="ovc">'
-        '<div class="logo"><div class="spin"></div></div>'
-        '<h2>Buscando multas…</h2>'
-        f'<div class="st">{html.escape(estado)}</div>'
-        f'<div class="bar"><div style="width:{max(pct, 6)}%"></div></div>'
-        '<div class="tip">Tip: el resumen flotante te permitirá navegar rápidamente.</div>'
-        '</div></div>'
-    )
-
-
-def _secret(nombre: str) -> str:
-    try:
-        return str(st.secrets.get(nombre, "") or "")
-    except Exception:  # noqa: BLE001
-        return ""
-
-
-# =============================================================================
-# 8. INTERFAZ DE USUARIO
-# =============================================================================
-n_jur = len(JURISDICCIONES)
-chips = "".join(f'<span class="chip"><span class="dot"></span>{html.escape(j.nombre)}</span>' for j in JURISDICCIONES)
-
-st.markdown(
-    '<div class="hero">'
-    '<h1>Buscar infracciones<br>por patente</h1>'
-    '<p class="lead">Consulta en todas las jurisdicciones disponibles. Resultados claros y simples.</p>'
-    '<span class="pill">⚡ Resultados en segundos</span>'
-    '<span class="pill">🛡️ Fuentes oficiales</span>'
-    f'<span class="pill">📍 {n_jur} jurisdicciones consultadas</span>'
-    '<div class="panel">'
-    '<div class="panel-head"><span class="panel-title">Jurisdicciones consultadas</span>'
-    '<span class="panel-tag">Servicio activo</span></div>'
-    '<div class="panel-sub">Se consultan automáticamente.</div>'
-    f'{chips}</div>'
-    '<div class="steps">'
-    '<div class="step"><b class="t"><span class="n">1</span>Ingresá tu patente (sin espacios)</b>'
-    '<small>Formatos válidos: LLLNNN · LLNNNLL · LNNNLLL · NNNLLL</small></div>'
-    f'<div class="step"><b class="t"><span class="n">2</span>Consultamos {n_jur} jurisdicciones</b>'
-    '<small>Unificamos los resultados.</small></div>'
-    '<div class="step"><b class="t"><span class="n">3</span>Resultado completo</b>'
-    '<small>Detalle y totales claros.</small></div>'
-    '</div></div>',
-    unsafe_allow_html=True,
-)
-
-with st.form("buscador", clear_on_submit=False, border=True):
-    patente_input = st.text_input(
-        "Patente",
-        placeholder="INGRESÁ TU PATENTE (LLLNNN · LLNNNLL · LNNNLLL · NNNLLL)",
-        max_chars=10,
-    )
-    c1, c2 = st.columns([3, 1])
-    with c1:
-        modo = st.selectbox(
-            "Jurisdicciones",
-            ["Todas", "Solo sin CAPTCHA", "Solo con CAPTCHA / Cloudflare"],
-            label_visibility="collapsed",
-        )
-    with c2:
-        enviar = st.form_submit_button("🔎  Consultar", use_container_width=True)
-
-with st.expander("⚙️ Opciones de desarrollo y Captcha"):
-    col_p, col_k = st.columns([1, 2])
-    with col_p:
-        proveedor_captcha = st.selectbox("Proveedor de Captcha", ["capsolver", "2captcha"])
-    with col_k:
-        clave_defecto = _secret("CAPSOLVER_API_KEY") or os.getenv("CAPSOLVER_API_KEY", "") or os.getenv("CAPTCHA_API_KEY", "")
-        api_key_captcha = st.text_input(
-            "API Key del Captcha pago",
-            value=clave_defecto,
-            type="password",
-            placeholder="Pegá acá tu API Key de CapSolver o 2Captcha (o cargala en Secrets)",
-        )
-    mostrar_diag = st.checkbox("Mostrar diagnóstico por portal (respuesta cruda del servidor)", value=True)
-    demo = st.checkbox(
-        "Modo demo (datos SIMULADOS, solo para probar el diseño)",
-        value=False,
-        help="Apagado por defecto. Con esto activo NO se consulta ningún portal real ni se consume saldo.",
-    )
-
-# --- Ejecución ---------------------------------------------------------------
-if enviar:
-    dominio = normalizar_patente(patente_input)
-    if not PATRON_PATENTE.match(dominio):
-        st.error("Formato de patente inválido. Ejemplos: HNQ904, AB123CD, A123BCD, 123ABC.")
-    else:
-        if modo == "Solo sin CAPTCHA":
-            lista = [j for j in JURISDICCIONES if j.proteccion == "Sin CAPTCHA"]
-        elif modo == "Solo con CAPTCHA / Cloudflare":
-            lista = [j for j in JURISDICCIONES if j.proteccion != "Sin CAPTCHA"]
-        else:
-            lista = JURISDICCIONES
-
-        solver = CaptchaSolver(proveedor_captcha, api_key_captcha)
-        ph = st.empty()
-        ph.markdown(overlay(0, "Preparando consulta"), unsafe_allow_html=True)
-
-        def _progreso(hechas: int, total: int, nombre: str) -> None:
-            ph.markdown(overlay(int(hechas / total * 100), f"Consultado: {nombre} ({hechas}/{total})"),
-                        unsafe_allow_html=True)
-
-        res = asyncio.run(ejecutar_consultas(dominio, lista, demo, solver, _progreso))
-        ph.empty()
-        st.session_state["resultados"] = res
-        st.session_state["patente"] = dominio
-
-# --- Resultados --------------------------------------------------------------
-if "resultados" in st.session_state:
-    resultados: List[ResultadoJurisdiccion] = st.session_state["resultados"]
-    dominio = st.session_state["patente"]
-
-    con_multas = [r for r in resultados if r.estado == "con_multas"]
-    consultados_ok = [r for r in resultados if r.conectado]
-    fallidos = [r for r in resultados if r.estado in ESTADOS_FALLO]
-    total = sum(r.subtotal for r in con_multas)
-    hay_demo = any(r.demo for r in resultados)
-    parcial = bool(fallidos)
-
-    # Resumen flotante
-    filas = ""
-    for r in con_multas:
-        bg, _ = color_de(r.nombre)
-        n = len(r.infracciones)
-        filas += (
-            f'<div class="row" style="background:{bg}55"><span>{html.escape(r.nombre.upper()[:9])}</span>'
-            f'<span class="m"><small>{n} multa{"s" if n != 1 else ""}</small>{pesos(r.subtotal)}</span></div>'
-        )
-    if con_multas:
-        aviso = f'<div class="parcial">⚠ PARCIAL: {len(fallidos)} portal(es) sin consultar</div>' if parcial else ""
-        st.markdown(
-            '<div class="float"><div class="h">Resumen</div><div class="s">JURISDICCIONES</div>'
-            f'{filas}<div class="s">TOTAL GENERAL</div><div class="tot">{pesos(total)}</div>{aviso}</div>',
-            unsafe_allow_html=True,
-        )
-
-    # Cabecera de resultados
-    jchips = "".join(
-        f'<a class="jchip" href="#j{i}" style="background:{color_de(r.nombre)[0]}">'
-        f'{html.escape(r.nombre)} ({len(r.infracciones)})</a>'
-        for i, r in enumerate(con_multas)
-    )
-    if con_multas:
-        intro = "Encontramos información para la patente consultada."
-    elif consultados_ok and not parcial:
-        intro = "No encontramos infracciones en las jurisdicciones consultadas."
-    elif consultados_ok:
-        intro = "Sin multas en los portales que respondieron, pero algunos no pudieron consultarse."
-    else:
-        intro = "No se pudo completar la consulta automática. Revisá el estado de cada portal."
-    st.markdown(
-        '<div class="hero" style="margin-top:1.2rem">'
-        '<h1>Resultado de búsqueda<br>por patente</h1>'
-        f'<p class="lead">{intro}</p>'
-        f'<span class="pill">Patente &nbsp; <b>{html.escape(dominio)}</b></span>'
-        + (
-            '<div class="panel"><div class="panel-title">Jurisdicciones</div>'
-            '<div class="panel-sub">Tocá una jurisdicción para navegar al detalle (se muestra cantidad de multas).</div>'
-            f'{jchips}</div>'
-            if con_multas else ""
-        )
-        + "</div>",
-        unsafe_allow_html=True,
-    )
-
-    if hay_demo:
-        st.markdown('<div class="warn">⚠️ <b>Modo demo:</b> los datos mostrados son simulados, no corresponden a multas reales.</div>', unsafe_allow_html=True)
-
-    if parcial and not hay_demo:
-        nombres = ", ".join(html.escape(r.nombre) for r in fallidos)
-        st.markdown(
-            f'<div class="warn">⚠️ <b>Resultado PARCIAL.</b> No se pudo consultar: {nombres}. '
-            'El total puede ser mayor al mostrado. Revisá el detalle más abajo.</div>',
-            unsafe_allow_html=True,
-        )
-
-    # Tablas por jurisdicción
-    for i, r in enumerate(con_multas):
-        _, dot = color_de(r.nombre)
-        filas_t = ""
-        for inf in r.infracciones:
-            tag = '<span class="tag">MULTA CON CONTROLADOR</span><br>' if inf.controlador else ""
-            filas_t += (
-                f"<tr><td>{html.escape(inf.acta)}</td>"
-                f"<td>{tag}{html.escape(inf.descripcion)}</td>"
-                f"<td>{pesos(inf.monto)}</td></tr>"
-            )
-        st.markdown(
-            f'<div class="card" id="j{i}"><h3><i style="background:{dot}"></i>Multas {html.escape(r.nombre)}</h3>'
-            '<table class="t"><thead><tr><th>N° Acta</th><th>Descripción</th><th>Monto</th></tr></thead>'
-            f"<tbody>{filas_t}</tbody></table></div>",
-            unsafe_allow_html=True,
-        )
-
-    if consultados_ok and not con_multas and not parcial:
-        st.markdown(f'<div class="ok">✅ La patente {html.escape(dominio)} no registra infracciones en las jurisdicciones consultadas automáticamente.</div>', unsafe_allow_html=True)
-
-    # Estado de TODOS los portales
-    filas_p = ""
-    for r in resultados:
-        etiqueta, clase = ESTADO_UI.get(r.estado, (r.estado, "neutral"))
-        extra = f" · {len(r.infracciones)} multa(s)" if r.estado == "con_multas" else ""
-        filas_p += (
-            f'<tr><td>{html.escape(r.nombre)}</td>'
-            f'<td><span class="est {clase}">{etiqueta}</span>{extra}</td>'
-            f'<td style="text-align:left">{html.escape(r.detalle) or "—"}</td>'
-            f'<td><a class="portal" href="{html.escape(r.url)}" target="_blank" rel="noopener">Abrir portal ↗</a></td></tr>'
-        )
-    st.markdown(
-        '<div class="card"><h3><i style="background:#9ca3af"></i>Estado de cada portal</h3>'
-        f'<p style="color:#6b7280;font-size:.88rem;margin-top:-.4rem">Patente consultada: <b>{html.escape(dominio)}</b>.</p>'
-        '<table class="t"><thead><tr><th>Jurisdicción</th><th>Estado</th><th>Detalle</th><th>Acceso</th></tr></thead>'
-        f"<tbody>{filas_p}</tbody></table></div>",
-        unsafe_allow_html=True,
-    )
-
-    # Resumen en JSON
-    datos_json = resumen_json(dominio, resultados)
-    with st.expander("📦 Resumen en JSON", expanded=False):
-        st.json(datos_json)
-        st.download_button(
-            "⬇️ Descargar JSON",
-            data=json.dumps(datos_json, ensure_ascii=False, indent=2),
-            file_name=f"infracciones_{dominio}.json",
-            mime="application/json",
-        )
-
-    # Diagnóstico
-    if mostrar_diag and fallidos:
-        with st.expander("🛠️ Diagnóstico de portales con problemas", expanded=True):
-            for r in fallidos:
-                st.markdown(f"**{r.nombre}** — {ESTADO_UI[r.estado][0]} · HTTP {r.http_status or '—'}")
-                st.caption(r.detalle)
-                if r.muestra:
-                    st.code(r.muestra, language="text")
+        "resultado_completo": not fallos,
+        "total_general": total,
+        "total_general_formato
