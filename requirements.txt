@@ -1,3 +1,4 @@
 streamlit
 httpx
 beautifulsoup4
+tzdata
