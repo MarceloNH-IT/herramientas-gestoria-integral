@@ -1,19 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-Gestoría Integral | Buscador de infracciones por patente (100% Streamlit + HTTP Directo)
-Sin navegadores externos (Sin Playwright / Sin Selenium / Sin Chromium).
-Ejecutar con:   streamlit run app.py
+Gestoría Integral | Buscador de infracciones por patente (Streamlit + HTTP directo + CapSolver)
+Ejecutar con:   streamlit run GestoriaF.py
 Requisitos:     pip install streamlit httpx beautifulsoup4
+
+Cambios clave respecto a la versión anterior:
+  * Cada portal devuelve un ESTADO explícito (con_multas / sin_multas / error /
+    captcha_fallido / indeterminado / sin_conector). Ya no se confunde "no pude leer
+    el portal" con "no tiene multas".
+  * El parser ignora <script>/<style>, detecta columnas por encabezado y soporta JSON.
+  * Se valida el formulario ANTES de gastar un captcha (si el portal es una SPA sin
+    formulario, no se consume saldo de CapSolver).
+  * El sitekey también se busca dentro de los .js del portal (SPAs).
+  * Timeouts coherentes con el tiempo de resolución del captcha.
+  * El total se marca como PARCIAL si algún portal falló.
+  * Resumen en JSON (con descarga) y panel de diagnóstico por portal.
 """
 from __future__ import annotations
 
 import asyncio
 import html
+import json
 import os
 import random
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Awaitable, Callable, List
+from urllib.parse import urljoin
+from zoneinfo import ZoneInfo
 
 import httpx
 import streamlit as st
@@ -103,6 +118,11 @@ table.t tr:nth-child(odd) td { background:#fffbe6; }
 .ok { background:#f0fdf4; border:1px solid #bbf7d0; color:#166534; border-radius:14px;
   padding:.8rem 1rem; font-size:.9rem; margin-top:1rem; }
 a.portal { color:#2563eb; font-weight:600; text-decoration:none; }
+.est { display:inline-block; border-radius:999px; padding:3px 10px; font-size:.72rem; font-weight:800; }
+.est.good { background:#dcfce7; color:#166534; }
+.est.bad  { background:#fee2e2; color:#991b1b; }
+.est.warn { background:#fef3c7; color:#92400e; }
+.est.neutral { background:#e5e7eb; color:#374151; }
 
 /* Resumen flotante */
 .float { position:fixed; top:90px; right:24px; width:250px; background:#fffef8; z-index:50;
@@ -115,6 +135,7 @@ a.portal { color:#2563eb; font-weight:600; text-decoration:none; }
 .float .row span.m small { display:block; color:#6b7280; font-weight:700; font-size:.65rem; }
 .float .tot { border:1px solid #e5e7eb; border-radius:14px; text-align:center; padding:.6rem;
   background:#fff; font-size:1rem; }
+.float .parcial { font-size:.65rem; color:#9a3412; font-weight:800; margin-top:.4rem; text-align:center; }
 @media (max-width: 1500px) { .float { position:static; width:auto; margin-top:1rem; } }
 
 /* ---------- OVERLAY DE CARGA ---------- */
@@ -143,11 +164,38 @@ HEADERS_HTTP = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,*/*;q=0.8",
     "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
 }
+TZ_AR = ZoneInfo("America/Argentina/Buenos_Aires")
 
 
 # =============================================================================
-# 2. MODELOS DE DATOS
+# 2. MODELOS DE DATOS Y ESTADOS
 # =============================================================================
+ESTADOS_OK = ("con_multas", "sin_multas")
+ESTADOS_FALLO = ("error", "captcha_fallido", "indeterminado")
+
+ESTADO_UI = {
+    "con_multas": ("Con multas", "good"),
+    "sin_multas": ("Sin multas", "good"),
+    "error": ("Error de conexión", "bad"),
+    "captcha_fallido": ("Captcha falló", "bad"),
+    "indeterminado": ("No se pudo leer", "warn"),
+    "sin_conector": ("Consulta manual", "neutral"),
+}
+
+
+class CaptchaError(Exception):
+    """Falla del servicio de captcha (saldo, clave, timeout, rechazo)."""
+
+
+class ConsultaIndeterminada(Exception):
+    """El portal respondió pero no se pudo interpretar el resultado."""
+
+    def __init__(self, msg: str, http_status: int | None = None, muestra: str = ""):
+        super().__init__(msg)
+        self.http_status = http_status
+        self.muestra = muestra
+
+
 @dataclass
 class Infraccion:
     acta: str
@@ -157,14 +205,27 @@ class Infraccion:
 
 
 @dataclass
+class RespuestaPortal:
+    infracciones: List[Infraccion]
+    http_status: int | None = None
+    muestra: str = ""
+
+
+@dataclass
 class ResultadoJurisdiccion:
     nombre: str
     proteccion: str
     url: str
-    conectado: bool = False
-    error: str = ""
+    estado: str = "pendiente"
+    detalle: str = ""
+    http_status: int | None = None
+    muestra: str = ""
     demo: bool = False
     infracciones: List[Infraccion] = field(default_factory=list)
+
+    @property
+    def conectado(self) -> bool:
+        return self.estado in ESTADOS_OK
 
     @property
     def subtotal(self) -> float:
@@ -176,306 +237,389 @@ class JurisdiccionConfig:
     nombre: str
     proteccion: str
     url: str
-    consultar: Callable[[str], Awaitable[List[Infraccion]]] | None = None
+    consultar: Callable[[str, "CaptchaSolver"], Awaitable[RespuestaPortal]] | None = None
 
 
 # =============================================================================
-# 3. CLIENTE ANTI-CAPTCHA Y PARSEADORES HTTP PUROS (SIN NAVEGADOR)
+# 3. CLIENTE ANTI-CAPTCHA (CapSolver / 2Captcha)
 # =============================================================================
 class CaptchaSolver:
-    def __init__(self, provider: str = "2captcha", api_key: str = ""):
+    def __init__(self, provider: str = "capsolver", api_key: str = ""):
         self.provider = provider.lower().strip()
         self.api_key = api_key.strip()
 
     async def solve_recaptcha_v2(self, site_key: str, page_url: str, invisible: bool = False) -> str:
         if not self.api_key:
-            raise RuntimeError("Configurá tu API Key de Captcha en 'Opciones de desarrollo y Captcha'.")
+            raise CaptchaError("Falta la API Key del servicio de captcha (ver 'Opciones de desarrollo y Captcha').")
 
         async with httpx.AsyncClient(timeout=30) as client:
             if self.provider == "capsolver":
-                payload = {
-                    "clientKey": self.api_key,
-                    "task": {
-                        "type": "ReCaptchaV2TaskProxyLess",
-                        "websiteURL": page_url,
-                        "websiteKey": site_key,
-                        "isInvisible": invisible,
-                    },
+                task = {
+                    "type": "ReCaptchaV2TaskProxyLess",
+                    "websiteURL": page_url,
+                    "websiteKey": site_key,
                 }
-                r = await client.post("https://api.capsolver.com/createTask", json=payload)
+                if invisible:
+                    task["isInvisible"] = True
+                r = await client.post("https://api.capsolver.com/createTask",
+                                      json={"clientKey": self.api_key, "task": task})
                 data = r.json()
                 if data.get("errorId", 0) != 0:
-                    raise RuntimeError(f"CapSolver: {data.get('errorDescription')}")
+                    raise CaptchaError(f"CapSolver: {data.get('errorCode')} - {data.get('errorDescription')}")
                 task_id = data["taskId"]
 
-                for _ in range(40):
-                    await asyncio.sleep(2.5)
-                    res = await client.post(
-                        "https://api.capsolver.com/getTaskResult",
-                        json={"clientKey": self.api_key, "taskId": task_id},
-                    )
-                    res_data = res.json()
-                    if res_data.get("status") == "ready":
-                        return res_data["solution"]["gRecaptchaResponse"]
-                    if res_data.get("errorId", 0) != 0:
-                        raise RuntimeError(f"CapSolver: {res_data.get('errorDescription')}")
+                for _ in range(60):  # hasta ~2 min
+                    await asyncio.sleep(2)
+                    res = await client.post("https://api.capsolver.com/getTaskResult",
+                                            json={"clientKey": self.api_key, "taskId": task_id})
+                    rd = res.json()
+                    if rd.get("errorId", 0) != 0:
+                        raise CaptchaError(f"CapSolver: {rd.get('errorCode')} - {rd.get('errorDescription')}")
+                    if rd.get("status") == "ready":
+                        return rd["solution"]["gRecaptchaResponse"]
+                    if rd.get("status") == "failed":
+                        raise CaptchaError("CapSolver: la tarea falló")
             else:
                 params = {
-                    "key": self.api_key,
-                    "method": "userrecaptcha",
-                    "googlekey": site_key,
-                    "pageurl": page_url,
-                    "invisible": 1 if invisible else 0,
-                    "json": 1,
+                    "key": self.api_key, "method": "userrecaptcha", "googlekey": site_key,
+                    "pageurl": page_url, "invisible": 1 if invisible else 0, "json": 1,
                 }
                 r = await client.get("http://2captcha.com/in.php", params=params)
                 data = r.json()
                 if data.get("status") != 1:
-                    raise RuntimeError(f"2Captcha: {data.get('request')}")
+                    raise CaptchaError(f"2Captcha: {data.get('request')}")
                 req_id = data["request"]
 
-                for _ in range(40):
+                for _ in range(30):
                     await asyncio.sleep(4)
-                    res = await client.get(
-                        "http://2captcha.com/res.php",
-                        params={"key": self.api_key, "action": "get", "id": req_id, "json": 1},
-                    )
-                    res_data = res.json()
-                    if res_data.get("status") == 1:
-                        return res_data["request"]
-                    if res_data.get("request") != "CAPCHA_NOT_READY":
-                        raise RuntimeError(f"2Captcha: {res_data.get('request')}")
+                    res = await client.get("http://2captcha.com/res.php",
+                                           params={"key": self.api_key, "action": "get", "id": req_id, "json": 1})
+                    rd = res.json()
+                    if rd.get("status") == 1:
+                        return rd["request"]
+                    if rd.get("request") != "CAPCHA_NOT_READY":
+                        raise CaptchaError(f"2Captcha: {rd.get('request')}")
 
-        raise TimeoutError("Tiempo agotado esperando la solución del Captcha.")
+        raise CaptchaError("Tiempo agotado esperando la solución del captcha.")
 
 
-def limpiar_monto(texto: str) -> float | None:
-    if not texto:
+# =============================================================================
+# 4. PARSEO ROBUSTO (HTML + JSON)
+# =============================================================================
+RE_VACIO = re.compile(
+    r"no registra|no posee|no se encontr|sin infracciones|sin deuda|libre de deuda|"
+    r"no tiene (infracciones|multas|deuda|actas)|no existen|no hay (infracciones|multas|actas)|"
+    r"sin resultados|0 resultados|no se hallaron",
+    re.I,
+)
+RE_CAPTCHA_MAL = re.compile(
+    r"captcha (inv[aá]lido|incorrecto|expirado|vencido)|verificaci[oó]n .{0,30}(fall|inv[aá]lid)|"
+    r"recaptcha.{0,30}(fall|inv[aá]lid|error)|robot.{0,40}(fall|error)",
+    re.I,
+)
+
+
+def limpiar_monto(texto) -> float | None:
+    if texto is None or texto == "":
         return None
+    if isinstance(texto, (int, float)):
+        return float(texto)
     limpio = re.sub(r"[^\d,.]", "", str(texto))
-    if not limpio:
+    if not re.search(r"\d", limpio):
         return None
     if "," in limpio and "." in limpio:
-        limpio = limpio.replace(".", "").replace(",", ".")
+        # formato argentino 12.345,67  (o 12,345.67 si el último separador es el punto)
+        if limpio.rfind(",") > limpio.rfind("."):
+            limpio = limpio.replace(".", "").replace(",", ".")
+        else:
+            limpio = limpio.replace(",", "")
     elif "," in limpio:
         limpio = limpio.replace(",", ".")
+    elif re.fullmatch(r"\d{1,3}(\.\d{3})+", limpio):
+        limpio = limpio.replace(".", "")  # 12.345 -> 12345
     try:
         return float(limpio)
     except ValueError:
         return None
 
 
-def extraer_sitekey_html(html_text: str) -> str | None:
-    """Busca la clave pública de Google reCAPTCHA directamente en el código fuente HTML/JS."""
-    patrones = [
-        r'data-sitekey=["\']([0-9A-Za-z_-]{40})["\']',
-        r'sitekey\s*:\s*["\']([0-9A-Za-z_-]{40})["\']',
-        r'recaptcha/api\.js\?[^"\']*render=([0-9A-Za-z_-]{40})',
-        r'[?&]k=([0-9A-Za-z_-]{40})',
-    ]
-    for p in patrones:
-        m = re.search(p, html_text)
+def texto_visible(soup: BeautifulSoup) -> str:
+    for t in soup(["script", "style", "noscript", "template"]):
+        t.decompose()
+    return re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
+
+
+def _tabla_a_infracciones(soup: BeautifulSoup) -> List[Infraccion]:
+    out: List[Infraccion] = []
+    for table in soup.find_all("table"):
+        idx_acta = idx_desc = idx_monto = None
+        for tr in table.find_all("tr"):
+            celdas = tr.find_all(["th", "td"])
+            textos = [c.get_text(" ", strip=True) for c in celdas]
+            es_encabezado = bool(tr.find("th")) or (
+                not tr.find("td") is None and False
+            )
+            if es_encabezado:
+                for i, h in enumerate(textos):
+                    hl = h.lower()
+                    if idx_monto is None and re.search(r"monto|importe|total|deuda|saldo|a pagar|valor", hl):
+                        idx_monto = i
+                    elif idx_acta is None and re.search(r"acta|n[°ºo]\b|nro|n[uú]mero|comprobante|expediente", hl):
+                        idx_acta = i
+                    elif idx_desc is None and re.search(r"descrip|infracci|falta|motivo|concepto|norma", hl):
+                        idx_desc = i
+                continue
+            tds = tr.find_all("td")
+            if len(tds) < 2:
+                continue
+            cols = [td.get_text(" ", strip=True) for td in tds]
+            acta = cols[idx_acta] if idx_acta is not None and idx_acta < len(cols) else cols[0]
+            if not re.search(r"\d", acta):
+                continue
+            desc = cols[idx_desc] if idx_desc is not None and idx_desc < len(cols) else (cols[1] if len(cols) > 1 else "")
+            monto = None
+            if idx_monto is not None and idx_monto < len(cols):
+                monto = limpiar_monto(cols[idx_monto])
+            if monto is None:  # buscar de derecha a izquierda una celda con importe
+                for c in reversed(cols[1:]):
+                    if re.search(r"\$|\d+[.,]\d{2}\b", c):
+                        monto = limpiar_monto(c)
+                        if monto is not None:
+                            break
+            out.append(Infraccion(
+                acta=acta[:30],
+                descripcion=(desc or "Infracción de tránsito")[:140],
+                monto=monto,
+                controlador="controlador" in " ".join(cols).lower(),
+            ))
+    return out
+
+
+def _listas_de_dicts(obj, acc: list, vacias: list) -> None:
+    if isinstance(obj, list):
+        if not obj:
+            vacias.append(True)
+        elif all(isinstance(x, dict) for x in obj):
+            acc.append(obj)
+        for x in obj:
+            _listas_de_dicts(x, acc, vacias)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _listas_de_dicts(v, acc, vacias)
+
+
+def _val(d: dict, patron: str):
+    for k, v in d.items():
+        if re.search(patron, str(k), re.I) and v not in (None, "") and not isinstance(v, (dict, list)):
+            return v
+    return None
+
+
+def _json_a_infracciones(data) -> tuple[List[Infraccion], bool]:
+    listas: list = []
+    vacias: list = []
+    _listas_de_dicts(data, listas, vacias)
+    out: List[Infraccion] = []
+    for lista in listas:
+        for d in lista:
+            acta = _val(d, r"acta|nro|numero|n[uú]m|comprobante|expediente|^id$")
+            monto = _val(d, r"monto|importe|total|deuda|saldo|valor")
+            desc = _val(d, r"descrip|infracci|falta|motivo|concepto")
+            if acta is None or monto is None:
+                continue
+            out.append(Infraccion(
+                acta=str(acta)[:30],
+                descripcion=str(desc or "Infracción de tránsito")[:140],
+                monto=limpiar_monto(monto),
+                controlador="controlador" in json.dumps(d, ensure_ascii=False).lower(),
+            ))
+    return out, bool(vacias)
+
+
+def _dedup(items: List[Infraccion]) -> List[Infraccion]:
+    vistos, res = set(), []
+    for i in items:
+        k = (i.acta, i.monto)
+        if k not in vistos:
+            vistos.add(k)
+            res.append(i)
+    return res
+
+
+def interpretar_respuesta(resp: httpx.Response) -> RespuestaPortal:
+    """Convierte la respuesta HTTP en infracciones o lanza un error EXPLÍCITO."""
+    ctype = resp.headers.get("content-type", "").lower()
+    cuerpo = resp.text or ""
+    muestra = re.sub(r"\s+", " ", cuerpo)[:800]
+
+    if resp.status_code >= 400:
+        extra = " (posible bloqueo por IP extranjera / WAF)" if resp.status_code in (403, 429) else ""
+        raise ConsultaIndeterminada(f"HTTP {resp.status_code}{extra}", resp.status_code, muestra)
+
+    # --- JSON ---
+    if "json" in ctype or cuerpo.lstrip().startswith(("{", "[")):
+        try:
+            data = resp.json()
+        except ValueError:
+            data = None
+        if data is not None:
+            items, hay_lista_vacia = _json_a_infracciones(data)
+            if items:
+                return RespuestaPortal(_dedup(items), resp.status_code, muestra)
+            if hay_lista_vacia or RE_VACIO.search(cuerpo):
+                return RespuestaPortal([], resp.status_code, muestra)
+            raise ConsultaIndeterminada("JSON sin estructura de infracciones reconocible", resp.status_code, muestra)
+
+    # --- HTML ---
+    soup = BeautifulSoup(cuerpo, "html.parser")
+    items = _tabla_a_infracciones(BeautifulSoup(cuerpo, "html.parser"))
+    if items:
+        return RespuestaPortal(_dedup(items), resp.status_code, muestra)
+
+    visible = texto_visible(soup)
+    muestra = visible[:800] or muestra
+    if RE_CAPTCHA_MAL.search(visible):
+        raise CaptchaError("El portal rechazó el token del captcha")
+    if RE_VACIO.search(visible):
+        return RespuestaPortal([], resp.status_code, muestra)
+    raise ConsultaIndeterminada(
+        "Respuesta sin tabla de infracciones ni mensaje de 'sin infracciones' (¿cambió el portal?)",
+        resp.status_code, muestra,
+    )
+
+
+# =============================================================================
+# 5. CONECTORES HTTP
+# =============================================================================
+def nuevo_cliente(timeout: int = 40) -> httpx.AsyncClient:
+    return httpx.AsyncClient(verify=False, follow_redirects=True, timeout=timeout, headers=HEADERS_HTTP)
+
+
+RE_CAMPO_PATENTE = re.compile(r"domin|patent|vehic|plac", re.I)
+RE_SITEKEY = [
+    r'data-sitekey=["\']([0-9A-Za-z_-]{40})["\']',
+    r'sitekey["\']?\s*[:=]\s*["\']([0-9A-Za-z_-]{40})["\']',
+    r'recaptcha/(?:api|enterprise)\.js\?[^"\']*render=([0-9A-Za-z_-]{40})',
+    r'[?&]k=([0-9A-Za-z_-]{40})',
+    r'["\'](6L[0-9A-Za-z_-]{38})["\']',
+]
+
+# Si conocés el sitekey de algún portal, cargalo acá y se evita buscarlo.
+SITEKEYS_CONOCIDAS: dict[str, str] = {}
+
+
+def _buscar_sitekey_en_texto(texto: str) -> str | None:
+    for p in RE_SITEKEY:
+        m = re.search(p, texto)
         if m:
             return m.group(1)
     return None
 
 
-def parsear_tabla_html(html_content: str) -> List[Infraccion]:
-    if re.search(r"no registra|no posee|sin infracciones|no se encontraron|libre de deuda|sin deuda", html_content, re.I):
-        return []
-    soup = BeautifulSoup(html_content, "html.parser")
-    multas: List[Infraccion] = []
-    for tr in soup.select("table tbody tr, table tr"):
-        cols = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
-        if len(cols) >= 3 and any(c.isdigit() for c in cols[0]):
-            multas.append(
-                Infraccion(
-                    acta=cols[0][:30],
-                    descripcion=cols[1][:120] or "Infracción de tránsito",
-                    monto=limpiar_monto(cols[-1]),
-                    controlador="controlador" in " ".join(cols).lower(),
-                )
-            )
-    return multas
+async def buscar_sitekey(client: httpx.AsyncClient, url: str, html_text: str) -> str | None:
+    """Busca el sitekey en el HTML y, si no está, dentro de los .js del portal (SPAs)."""
+    for dominio, key in SITEKEYS_CONOCIDAS.items():
+        if dominio in url:
+            return key
+    key = _buscar_sitekey_en_texto(html_text)
+    if key:
+        return key
+    soup = BeautifulSoup(html_text, "html.parser")
+    scripts = [urljoin(url, s["src"]) for s in soup.find_all("script", src=True)]
+    scripts = [s for s in scripts if "google.com" not in s and "gstatic.com" not in s][:8]
+    for s in scripts:
+        try:
+            r = await client.get(s)
+            key = _buscar_sitekey_en_texto(r.text)
+            if key:
+                return key
+        except httpx.HTTPError:
+            continue
+    return None
+
+
+def _es_input_texto(tag) -> bool:
+    return tag.name == "input" and (tag.get("type") or "text").lower() in ("text", "search")
+
+
+def preparar_form(soup: BeautifulSoup, base_url: str, patente: str):
+    """Devuelve (metodo, url_destino, datos) del formulario que contiene el campo patente."""
+    campos = soup.find_all(_es_input_texto)
+    campo = next((c for c in campos if RE_CAMPO_PATENTE.search((c.get("name") or "") + " " + (c.get("id") or ""))), None)
+    campo = campo or (campos[0] if campos else None)
+    if campo is None or not campo.get("name"):
+        raise ConsultaIndeterminada(
+            "No hay formulario con campo de patente en el HTML (portal SPA/JS: requiere conocer su API)."
+        )
+    form = campo.find_parent("form")
+    scope = form or soup
+    datos = {i["name"]: i.get("value", "") for i in scope.find_all("input", {"type": "hidden"}) if i.get("name")}
+    datos[campo["name"]] = patente
+    btn = scope.find("input", {"type": "submit"}) or scope.find("button", {"type": "submit"})
+    if btn is not None and btn.get("name"):
+        datos[btn["name"]] = btn.get("value", "") or "Consultar"
+    metodo = ((form.get("method") if form else None) or "post").lower()
+    destino = urljoin(base_url, form["action"]) if (form and form.get("action")) else base_url
+    return metodo, destino, datos
+
+
+async def http_formulario(url: str, patente: str, solver: CaptchaSolver | None = None,
+                          invisible: bool = False) -> RespuestaPortal:
+    """Conector genérico: GET del formulario → (captcha) → envío → interpretación."""
+    async with nuevo_cliente(45) as client:
+        r_get = await client.get(url)
+        if r_get.status_code >= 400:
+            interpretar_respuesta(r_get)  # lanza el error con detalle
+        soup = BeautifulSoup(r_get.text, "html.parser")
+        metodo, destino, datos = preparar_form(soup, str(r_get.url), patente)  # valida ANTES de gastar captcha
+
+        if solver is not None:
+            sitekey = await buscar_sitekey(client, str(r_get.url), r_get.text)
+            if not sitekey:
+                raise ConsultaIndeterminada("No se encontró el sitekey de reCAPTCHA en el portal.",
+                                            r_get.status_code, re.sub(r"\s+", " ", r_get.text)[:400])
+            token = await solver.solve_recaptcha_v2(sitekey, str(r_get.url), invisible=invisible)
+            datos["g-recaptcha-response"] = token  # se usa de inmediato (dura ~2 min, un solo uso)
+
+        if metodo == "get":
+            r_post = await client.get(destino, params=datos)
+        else:
+            r_post = await client.post(destino, data=datos, headers={"Referer": str(r_get.url)})
+        return interpretar_respuesta(r_post)
 
 
 # =============================================================================
-# 4. CONECTORES HTTP PUROS (9 JURISDICCIONES SIN CHROMIUM)
+# 6. JURISDICCIONES Y COLORES
 # =============================================================================
-
-# --- 1. POSADAS (Sin Captcha - POST Directo) ---
-async def http_posadas(patente: str) -> List[Infraccion]:
-    url = "https://sistema.posadas.gov.ar/mp_sistemas/autogestion/consultarmultadominio"
-    async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=25, headers=HEADERS_HTTP) as client:
-        r_get = await client.get(url)
-        soup = BeautifulSoup(r_get.text, "html.parser")
-        form_data = {i["name"]: i.get("value", "") for i in soup.find_all("input", {"type": "hidden"}) if i.get("name")}
-        inp_dom = soup.find("input", {"type": "text"})
-        campo = inp_dom["name"] if (inp_dom and inp_dom.get("name")) else "dominio"
-        form_data[campo] = patente
-        r_post = await client.post(url, data=form_data)
-        return parsear_tabla_html(r_post.text)
-
-
-# --- 2. LOMAS DE ZAMORA (Sin Captcha - ASP.NET ViewState HTTP) ---
-async def http_lomas(patente: str) -> List[Infraccion]:
-    url = "https://webextra.lomasdezamora.gov.ar/infracciones/ConsultaFaltasNuevoMP.aspx"
-    async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=25, headers=HEADERS_HTTP) as client:
-        r_get = await client.get(url)
-        soup = BeautifulSoup(r_get.text, "html.parser")
-        # Captura todos los campos ocultos de ASP.NET (__VIEWSTATE, __EVENTVALIDATION, etc.)
-        form_data = {i["name"]: i.get("value", "") for i in soup.find_all("input", {"type": "hidden"}) if i.get("name")}
-        for inp in soup.find_all("input", {"type": "text"}):
-            if inp.get("name"):
-                form_data[inp["name"]] = patente
-        btn = soup.find("input", {"type": "submit"})
-        if btn and btn.get("name"):
-            form_data[btn["name"]] = btn.get("value", "Consultar")
-        r_post = await client.post(url, data=form_data)
-        return parsear_tabla_html(r_post.text)
-
-
-# --- 3. ROSARIO (Sin Captcha - Formulario HTTP) ---
-async def http_rosario(patente: str) -> List[Infraccion]:
-    url = "https://www.rosario.gob.ar/gdm/patente.do?accion=ir"
-    async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=25, headers=HEADERS_HTTP) as client:
-        r_get = await client.get(url)
-        soup = BeautifulSoup(r_get.text, "html.parser")
-        form = soup.find("form")
-        post_url = url
-        if form and form.get("action"):
-             post_url = str(httpx.URL(url).join(form["action"]))
-        form_data = {i["name"]: i.get("value", "") for i in soup.find_all("input", {"type": "hidden"}) if i.get("name")}
-        inp_txt = soup.find("input", {"type": "text"})
-        campo = inp_txt["name"] if (inp_txt and inp_txt.get("name")) else "dominio"
-        form_data[campo] = patente
-        r_post = await client.post(post_url, data=form_data)
-        return parsear_tabla_html(r_post.text)
-
-
-# --- 4. EZEIZA / INFRATRACK (Con reCAPTCHA por HTTP) ---
-async def http_ezeiza(patente: str, solver: CaptchaSolver) -> List[Infraccion]:
-    url = "https://consulta-web.infratrack.com.ar/consultas.php?municipio=ezeiza"
-    async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=35, headers=HEADERS_HTTP) as client:
-        r_get = await client.get(url)
-        soup = BeautifulSoup(r_get.text, "html.parser")
-        sitekey = extraer_sitekey_html(r_get.text)
-
-        form_data = {i["name"]: i.get("value", "") for i in soup.find_all("input", {"type": "hidden"}) if i.get("name")}
-        inp_txt = soup.find("input", {"type": "text"})
-        campo = inp_txt["name"] if (inp_txt and inp_txt.get("name")) else "dominio"
-        form_data[campo] = patente
-
-        if sitekey:
-            token = await solver.solve_recaptcha_v2(sitekey, url)
-            form_data["g-recaptcha-response"] = token
-
-        form = soup.find("form")
-        post_url = str(httpx.URL(url).join(form["action"])) if (form and form.get("action")) else url
-        r_post = await client.post(post_url, data=form_data)
-        return parsear_tabla_html(r_post.text)
-
-
-# --- 5. ENTRE RÍOS Y 6. MISIONES (Monitoreo Vial REST/HTTP + reCAPTCHA) ---
-async def http_monitoreo_vial(base_url: str, patente: str, solver: CaptchaSolver) -> List[Infraccion]:
-    async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=35, headers=HEADERS_HTTP) as client:
-        r_get = await client.get(base_url)
-        sitekey = extraer_sitekey_html(r_get.text)
-        token = await solver.solve_recaptcha_v2(sitekey, base_url) if sitekey else ""
-
-        # Intenta consultar el endpoint del formulario/API con el token resuelto
-        soup = BeautifulSoup(r_get.text, "html.parser")
-        form_data = {"dominio": patente, "patente": patente, "g-recaptcha-response": token}
-        for i in soup.find_all("input", {"type": "hidden"}):
-            if i.get("name"):
-                form_data[i["name"]] = i.get("value", "")
-
-        r_post = await client.post(base_url, data=form_data)
-        return parsear_tabla_html(r_post.text)
-
-
-# --- 7. PBA, 8. CABA Y 9. LANÚS (Formulario/Endpoint HTTP + reCAPTCHA) ---
-async def http_portal_recaptcha_generico(url: str, patente: str, solver: CaptchaSolver, invisible: bool = False) -> List[Infraccion]:
-    async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=40, headers=HEADERS_HTTP) as client:
-        r_get = await client.get(url)
-        soup = BeautifulSoup(r_get.text, "html.parser")
-        sitekey = extraer_sitekey_html(r_get.text)
-
-        form_data = {i["name"]: i.get("value", "") for i in soup.find_all("input", {"type": "hidden"}) if i.get("name")}
-        # Cubrimos las variantes de nombres de campo más usadas en portales oficiales
-        form_data["dominio"] = patente
-        form_data["patente"] = patente
-        for inp in soup.find_all("input", {"type": "text"}):
-            if inp.get("name"):
-                form_data[inp["name"]] = patente
-
-        if sitekey:
-            token = await solver.solve_recaptcha_v2(sitekey, url, invisible=invisible)
-            form_data["g-recaptcha-response"] = token
-
-        form = soup.find("form")
-        post_url = str(httpx.URL(url).join(form["action"])) if (form and form.get("action")) else url
-        r_post = await client.post(post_url, data=form_data)
-        return parsear_tabla_html(r_post.text)
-
-
-# =============================================================================
-# 5. CONFIGURACIÓN DE JURISDICCIONES Y COLORES
-# =============================================================================
-if "solver" not in st.session_state:
-    st.session_state["solver"] = CaptchaSolver("2captcha", os.getenv("CAPTCHA_API_KEY", ""))
-
-
-def _solver() -> CaptchaSolver:
-    return st.session_state["solver"]
-
+URL_POSADAS = "https://sistema.posadas.gov.ar/mp_sistemas/autogestion/consultarmultadominio"
+URL_ROSARIO = "https://www.rosario.gob.ar/gdm/patente.do?accion=ir"
+URL_LOMAS = "https://webextra.lomasdezamora.gov.ar/infracciones/ConsultaFaltasNuevoMP.aspx"
+URL_PBA = "https://infraccionesba.gba.gob.ar/consulta-infraccion"
+URL_CABA = "https://buenosaires.gob.ar/licenciasdeconducir/consulta-de-infracciones/?actas=transito"
+URL_EZEIZA = "https://consulta-web.infratrack.com.ar/consultas.php?municipio=ezeiza"
+URL_ER = "https://monitoreovialentrerios.info/"
+URL_MISIONES = "https://monitoreovialmisiones.info/"
+URL_LANUS = "https://tramitesweb.lanus.gob.ar/lanusdigital/mis-dominios"
 
 JURISDICCIONES: List[JurisdiccionConfig] = [
-    JurisdiccionConfig(
-        "Posadas (Misiones)", "Sin CAPTCHA",
-        "https://sistema.posadas.gov.ar/mp_sistemas/autogestion/consultarmultadominio",
-        consultar=lambda pat: http_posadas(pat),
-    ),
-    JurisdiccionConfig(
-        "Rosario", "Sin CAPTCHA",
-        "https://www.rosario.gob.ar/gdm/patente.do?accion=ir",
-        consultar=lambda pat: http_rosario(pat),
-    ),
-    JurisdiccionConfig(
-        "Lomas de Zamora", "Sin CAPTCHA",
-        "https://webextra.lomasdezamora.gov.ar/infracciones/ConsultaFaltasNuevoMP.aspx",
-        consultar=lambda pat: http_lomas(pat),
-    ),
-    JurisdiccionConfig(
-        "PBA", "reCAPTCHA",
-        "https://infraccionesba.gba.gob.ar/consulta-infraccion",
-        consultar=lambda pat: http_portal_recaptcha_generico("https://infraccionesba.gba.gob.ar/consulta-infraccion", pat, _solver(), invisible=True),
-    ),
-    JurisdiccionConfig(
-        "CABA", "reCAPTCHA",
-        "https://buenosaires.gob.ar/licenciasdeconducir/consulta-de-infracciones/?actas=transito",
-        consultar=lambda pat: http_portal_recaptcha_generico("https://buenosaires.gob.ar/licenciasdeconducir/consulta-de-infracciones/?actas=transito", pat, _solver()),
-    ),
-    JurisdiccionConfig(
-        "Ezeiza", "reCAPTCHA",
-        "https://consulta-web.infratrack.com.ar/consultas.php?municipio=ezeiza",
-        consultar=lambda pat: http_ezeiza(pat, _solver()),
-    ),
-    JurisdiccionConfig(
-        "Entre Ríos", "reCAPTCHA",
-        "https://monitoreovialentrerios.info/#/consulta-infracciones",
-        consultar=lambda pat: http_monitoreo_vial("https://monitoreovialentrerios.info/", pat, _solver()),
-    ),
-    JurisdiccionConfig(
-        "Misiones", "reCAPTCHA",
-        "https://monitoreovialmisiones.info/#/",
-        consultar=lambda pat: http_monitoreo_vial("https://monitoreovialmisiones.info/", pat, _solver()),
-    ),
-    JurisdiccionConfig(
-        "Lanús", "reCAPTCHA",
-        "https://tramitesweb.lanus.gob.ar/lanusdigital/mis-dominios",
-        consultar=lambda pat: http_portal_recaptcha_generico("https://tramitesweb.lanus.gob.ar/lanusdigital/mis-dominios", pat, _solver()),
-    ),
+    JurisdiccionConfig("Posadas (Misiones)", "Sin CAPTCHA", URL_POSADAS,
+                       lambda p, s: http_formulario(URL_POSADAS, p)),
+    JurisdiccionConfig("Rosario", "Sin CAPTCHA", URL_ROSARIO,
+                       lambda p, s: http_formulario(URL_ROSARIO, p)),
+    JurisdiccionConfig("Lomas de Zamora", "Sin CAPTCHA", URL_LOMAS,
+                       lambda p, s: http_formulario(URL_LOMAS, p)),
+    JurisdiccionConfig("PBA", "reCAPTCHA", URL_PBA,
+                       lambda p, s: http_formulario(URL_PBA, p, s, invisible=True)),
+    JurisdiccionConfig("CABA", "reCAPTCHA", URL_CABA,
+                       lambda p, s: http_formulario(URL_CABA, p, s)),
+    JurisdiccionConfig("Ezeiza", "reCAPTCHA", URL_EZEIZA,
+                       lambda p, s: http_formulario(URL_EZEIZA, p, s)),
+    JurisdiccionConfig("Entre Ríos", "reCAPTCHA", "https://monitoreovialentrerios.info/#/consulta-infracciones",
+                       lambda p, s: http_formulario(URL_ER, p, s)),
+    JurisdiccionConfig("Misiones", "reCAPTCHA", "https://monitoreovialmisiones.info/#/",
+                       lambda p, s: http_formulario(URL_MISIONES, p, s)),
+    JurisdiccionConfig("Lanús", "reCAPTCHA", URL_LANUS,
+                       lambda p, s: http_formulario(URL_LANUS, p, s)),
     JurisdiccionConfig("Córdoba Caminera", "Sin CAPTCHA", "https://www.rentascordoba.gob.ar/emision/ver-y-pagar/caminera"),
     JurisdiccionConfig("Santa Fe", "CAPTCHA Texto", "https://www.santafe.gov.ar/juzgadovirtual/consultaInfraccion.do?method=BusquedaVehiculo"),
     JurisdiccionConfig("Vicente López", "Cloudflare", "https://infracciones.vicentelopez.gov.ar/causas-vecino"),
@@ -495,7 +639,7 @@ def color_de(nombre: str) -> tuple[str, str]:
 
 
 # =============================================================================
-# 6. MOTOR DE EJECUCIÓN ASÍNCRONO
+# 7. MOTOR DE EJECUCIÓN ASÍNCRONO
 # =============================================================================
 PATRON_PATENTE = re.compile(r"^([A-Z]{3}\d{3}|[A-Z]{2}\d{3}[A-Z]{2}|[A-Z]\d{3}[A-Z]{3}|\d{3}[A-Z]{3})$")
 
@@ -533,26 +677,50 @@ def _demo_infracciones(patente: str, nombre: str) -> List[Infraccion]:
     ]
 
 
-async def _consultar_una(cfg: JurisdiccionConfig, patente: str, demo: bool) -> ResultadoJurisdiccion:
-    base = ResultadoJurisdiccion(cfg.nombre, cfg.proteccion, cfg.url)
+async def _consultar_una(cfg: JurisdiccionConfig, patente: str, demo: bool, solver: CaptchaSolver) -> ResultadoJurisdiccion:
+    r = ResultadoJurisdiccion(cfg.nombre, cfg.proteccion, cfg.url)
+
+    if demo:
+        await asyncio.sleep(random.uniform(0.2, 0.7))
+        r.infracciones = _demo_infracciones(patente, cfg.nombre)
+        r.estado = "con_multas" if r.infracciones else "sin_multas"
+        r.demo = True
+        return r
+
+    if cfg.consultar is None:
+        r.estado = "sin_conector"
+        r.detalle = f"Sin consulta automática ({cfg.proteccion}). Abrir el portal."
+        return r
+
     try:
-        if demo:
-            await asyncio.sleep(random.uniform(0.2, 0.7))
-            base.infracciones = _demo_infracciones(patente, cfg.nombre)
-            base.conectado = True
-            base.demo = True
-        elif cfg.consultar is not None:
-            base.infracciones = await asyncio.wait_for(cfg.consultar(patente), timeout=65)
-            base.conectado = True
-        else:
-            await asyncio.sleep(0.05)
-    except Exception as exc:
-        base.error = f"{type(exc).__name__}: {exc}"
-    return base
+        resp: RespuestaPortal | None = None
+        for intento in (1, 2):  # un reintento solo ante fallos de red (no gasta captcha extra)
+            try:
+                resp = await asyncio.wait_for(cfg.consultar(patente, solver), timeout=150)
+                break
+            except httpx.TransportError:
+                if intento == 2:
+                    raise
+                await asyncio.sleep(1.5)
+        assert resp is not None
+        r.infracciones = resp.infracciones
+        r.http_status = resp.http_status
+        r.muestra = resp.muestra
+        r.estado = "con_multas" if resp.infracciones else "sin_multas"
+    except CaptchaError as exc:
+        r.estado, r.detalle = "captcha_fallido", str(exc)
+    except ConsultaIndeterminada as exc:
+        r.estado, r.detalle = "indeterminado", str(exc)
+        r.http_status, r.muestra = exc.http_status, exc.muestra
+    except asyncio.TimeoutError:
+        r.estado, r.detalle = "error", "Timeout: el portal no respondió a tiempo"
+    except Exception as exc:  # noqa: BLE001
+        r.estado, r.detalle = "error", f"{type(exc).__name__}: {exc}"
+    return r
 
 
-async def ejecutar_consultas(patente, lista, demo, on_progress) -> List[ResultadoJurisdiccion]:
-    tareas = [asyncio.create_task(_consultar_una(j, patente, demo)) for j in lista]
+async def ejecutar_consultas(patente, lista, demo, solver, on_progress) -> List[ResultadoJurisdiccion]:
+    tareas = [asyncio.create_task(_consultar_una(j, patente, demo, solver)) for j in lista]
     resultados: List[ResultadoJurisdiccion] = []
     total = len(tareas)
     for hecha in asyncio.as_completed(tareas):
@@ -560,7 +728,37 @@ async def ejecutar_consultas(patente, lista, demo, on_progress) -> List[Resultad
         resultados.append(r)
         on_progress(len(resultados), total, r.nombre)
     orden = {j.nombre: i for i, j in enumerate(JURISDICCIONES)}
-    return sorted(resultados, key=lambda r: orden[r.nombre])
+    return sorted(resultados, key=lambda x: orden[x.nombre])
+
+
+def resumen_json(patente: str, resultados: List[ResultadoJurisdiccion]) -> dict:
+    fallos = [r.nombre for r in resultados if r.estado in ESTADOS_FALLO]
+    manuales = [r.nombre for r in resultados if r.estado == "sin_conector"]
+    todas = [i for r in resultados for i in r.infracciones]
+    return {
+        "patente": patente,
+        "consultado_en": datetime.now(TZ_AR).isoformat(timespec="seconds"),
+        "completo": not fallos,
+        "total_infracciones": len(todas),
+        "total_general": round(sum(r.subtotal for r in resultados), 2),
+        "portales_con_fallo": fallos,
+        "portales_consulta_manual": manuales,
+        "jurisdicciones": [
+            {
+                "nombre": r.nombre,
+                "estado": r.estado,
+                "detalle": r.detalle,
+                "cantidad": len(r.infracciones),
+                "subtotal": round(r.subtotal, 2),
+                "url": r.url,
+                "infracciones": [
+                    {"acta": i.acta, "descripcion": i.descripcion, "monto": i.monto, "con_controlador": i.controlador}
+                    for i in r.infracciones
+                ],
+            }
+            for r in resultados
+        ],
+    }
 
 
 def overlay(pct: int, estado: str) -> str:
@@ -575,8 +773,15 @@ def overlay(pct: int, estado: str) -> str:
     )
 
 
+def _secret(nombre: str) -> str:
+    try:
+        return str(st.secrets.get(nombre, "") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 # =============================================================================
-# 7. INTERFAZ DE USUARIO (100% EN STREAMLIT)
+# 8. INTERFAZ DE USUARIO
 # =============================================================================
 n_jur = len(JURISDICCIONES)
 chips = "".join(f'<span class="chip"><span class="dot"></span>{html.escape(j.nombre)}</span>' for j in JURISDICCIONES)
@@ -623,20 +828,21 @@ with st.form("buscador", clear_on_submit=False, border=True):
 with st.expander("⚙️ Opciones de desarrollo y Captcha"):
     col_p, col_k = st.columns([1, 2])
     with col_p:
-        proveedor_captcha = st.selectbox("Proveedor de Captcha", ["2captcha", "capsolver"])
+        proveedor_captcha = st.selectbox("Proveedor de Captcha", ["capsolver", "2captcha"])
     with col_k:
+        clave_defecto = _secret("CAPSOLVER_API_KEY") or os.getenv("CAPSOLVER_API_KEY", "") or os.getenv("CAPTCHA_API_KEY", "")
         api_key_captcha = st.text_input(
             "API Key del Captcha pago",
-            value=os.getenv("CAPTCHA_API_KEY", ""),
+            value=clave_defecto,
             type="password",
-            placeholder="Pegá acá tu API Key de 2Captcha o CapSolver",
+            placeholder="Pegá acá tu API Key de CapSolver o 2Captcha (o cargala en Secrets)",
         )
+    mostrar_diag = st.checkbox("Mostrar diagnóstico por portal (respuesta cruda del servidor)", value=True)
     demo = st.checkbox(
         "Modo demo (datos SIMULADOS, solo para probar el diseño)",
         value=False,
         help="Apagado por defecto. Con esto activo NO se consulta ningún portal real ni se consume saldo.",
     )
-    st.session_state["solver"] = CaptchaSolver(proveedor_captcha, api_key_captcha)
 
 # --- Ejecución ---------------------------------------------------------------
 if enviar:
@@ -651,13 +857,15 @@ if enviar:
         else:
             lista = JURISDICCIONES
 
+        solver = CaptchaSolver(proveedor_captcha, api_key_captcha)
         ph = st.empty()
         ph.markdown(overlay(0, "Preparando consulta"), unsafe_allow_html=True)
 
         def _progreso(hechas: int, total: int, nombre: str) -> None:
-            ph.markdown(overlay(int(hechas / total * 100), f"Consultado: {nombre} ({hechas}/{total})"), unsafe_allow_html=True)
+            ph.markdown(overlay(int(hechas / total * 100), f"Consultado: {nombre} ({hechas}/{total})"),
+                        unsafe_allow_html=True)
 
-        res = asyncio.run(ejecutar_consultas(dominio, lista, demo, _progreso))
+        res = asyncio.run(ejecutar_consultas(dominio, lista, demo, solver, _progreso))
         ph.empty()
         st.session_state["resultados"] = res
         st.session_state["patente"] = dominio
@@ -667,11 +875,12 @@ if "resultados" in st.session_state:
     resultados: List[ResultadoJurisdiccion] = st.session_state["resultados"]
     dominio = st.session_state["patente"]
 
-    conectados = [r for r in resultados if r.conectado]
-    con_multas = [r for r in conectados if r.infracciones]
-    sin_conector = [r for r in resultados if not r.conectado]
+    con_multas = [r for r in resultados if r.estado == "con_multas"]
+    consultados_ok = [r for r in resultados if r.conectado]
+    fallidos = [r for r in resultados if r.estado in ESTADOS_FALLO]
     total = sum(r.subtotal for r in con_multas)
     hay_demo = any(r.demo for r in resultados)
+    parcial = bool(fallidos)
 
     # Resumen flotante
     filas = ""
@@ -683,9 +892,10 @@ if "resultados" in st.session_state:
             f'<span class="m"><small>{n} multa{"s" if n != 1 else ""}</small>{pesos(r.subtotal)}</span></div>'
         )
     if con_multas:
+        aviso = f'<div class="parcial">⚠ PARCIAL: {len(fallidos)} portal(es) sin consultar</div>' if parcial else ""
         st.markdown(
             '<div class="float"><div class="h">Resumen</div><div class="s">JURISDICCIONES</div>'
-            f'{filas}<div class="s">TOTAL GENERAL</div><div class="tot">{pesos(total)}</div></div>',
+            f'{filas}<div class="s">TOTAL GENERAL</div><div class="tot">{pesos(total)}</div>{aviso}</div>',
             unsafe_allow_html=True,
         )
 
@@ -697,10 +907,12 @@ if "resultados" in st.session_state:
     )
     if con_multas:
         intro = "Encontramos información para la patente consultada."
-    elif conectados:
+    elif consultados_ok and not parcial:
         intro = "No encontramos infracciones en las jurisdicciones consultadas."
+    elif consultados_ok:
+        intro = "Sin multas en los portales que respondieron, pero algunos no pudieron consultarse."
     else:
-        intro = "Todavía no hay consulta automática activa para estas jurisdicciones."
+        intro = "No se pudo completar la consulta automática. Revisá el estado de cada portal."
     st.markdown(
         '<div class="hero" style="margin-top:1.2rem">'
         '<h1>Resultado de búsqueda<br>por patente</h1>'
@@ -718,6 +930,14 @@ if "resultados" in st.session_state:
 
     if hay_demo:
         st.markdown('<div class="warn">⚠️ <b>Modo demo:</b> los datos mostrados son simulados, no corresponden a multas reales.</div>', unsafe_allow_html=True)
+
+    if parcial and not hay_demo:
+        nombres = ", ".join(html.escape(r.nombre) for r in fallidos)
+        st.markdown(
+            f'<div class="warn">⚠️ <b>Resultado PARCIAL.</b> No se pudo consultar: {nombres}. '
+            'El total puede ser mayor al mostrado. Revisá el detalle más abajo.</div>',
+            unsafe_allow_html=True,
+        )
 
     # Tablas por jurisdicción
     for i, r in enumerate(con_multas):
@@ -737,22 +957,44 @@ if "resultados" in st.session_state:
             unsafe_allow_html=True,
         )
 
-    if conectados and not con_multas:
+    if consultados_ok and not con_multas and not parcial:
         st.markdown(f'<div class="ok">✅ La patente {html.escape(dominio)} no registra infracciones en las jurisdicciones consultadas automáticamente.</div>', unsafe_allow_html=True)
 
-    # Jurisdicciones sin conector o con error
-    if sin_conector:
-        filas_p = "".join(
-            f'<tr><td>{html.escape(r.nombre)}</td><td>{html.escape(r.proteccion)}</td>'
-            f'<td>{"⚠️ " + html.escape(r.error) if r.error else "🛠️ Conector pendiente"}</td>'
+    # Estado de TODOS los portales
+    filas_p = ""
+    for r in resultados:
+        etiqueta, clase = ESTADO_UI.get(r.estado, (r.estado, "neutral"))
+        extra = f" · {len(r.infracciones)} multa(s)" if r.estado == "con_multas" else ""
+        filas_p += (
+            f'<tr><td>{html.escape(r.nombre)}</td>'
+            f'<td><span class="est {clase}">{etiqueta}</span>{extra}</td>'
+            f'<td style="text-align:left">{html.escape(r.detalle) or "—"}</td>'
             f'<td><a class="portal" href="{html.escape(r.url)}" target="_blank" rel="noopener">Abrir portal ↗</a></td></tr>'
-            for r in sin_conector
         )
-        st.markdown(
-            '<div class="card"><h3><i style="background:#9ca3af"></i>Consulta manual / Estado de portales</h3>'
-            f'<p style="color:#6b7280;font-size:.88rem;margin-top:-.4rem">Patente consultada: <b>{html.escape(dominio)}</b>. '
-            'Si algún portal gubernamental requiere validación adicional, podés abrirlo directo desde acá:</p>'
-            '<table class="t"><thead><tr><th>Jurisdicción</th><th>Protección</th><th>Estado</th><th>Acceso</th></tr></thead>'
-            f"<tbody>{filas_p}</tbody></table></div>",
-            unsafe_allow_html=True,
+    st.markdown(
+        '<div class="card"><h3><i style="background:#9ca3af"></i>Estado de cada portal</h3>'
+        f'<p style="color:#6b7280;font-size:.88rem;margin-top:-.4rem">Patente consultada: <b>{html.escape(dominio)}</b>.</p>'
+        '<table class="t"><thead><tr><th>Jurisdicción</th><th>Estado</th><th>Detalle</th><th>Acceso</th></tr></thead>'
+        f"<tbody>{filas_p}</tbody></table></div>",
+        unsafe_allow_html=True,
+    )
+
+    # Resumen en JSON
+    datos_json = resumen_json(dominio, resultados)
+    with st.expander("📦 Resumen en JSON", expanded=False):
+        st.json(datos_json)
+        st.download_button(
+            "⬇️ Descargar JSON",
+            data=json.dumps(datos_json, ensure_ascii=False, indent=2),
+            file_name=f"infracciones_{dominio}.json",
+            mime="application/json",
         )
+
+    # Diagnóstico
+    if mostrar_diag and fallidos:
+        with st.expander("🛠️ Diagnóstico de portales con problemas", expanded=True):
+            for r in fallidos:
+                st.markdown(f"**{r.nombre}** — {ESTADO_UI[r.estado][0]} · HTTP {r.http_status or '—'}")
+                st.caption(r.detalle)
+                if r.muestra:
+                    st.code(r.muestra, language="text")
