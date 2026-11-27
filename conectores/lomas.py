@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Conector de infracciones para Lomas de Zamora (formulario ASP.NET + lectura de comprobante).
+Conector de infracciones para Lomas de Zamora (flujo ASP.NET en 3 pasos + lectura de PDF).
 No requiere captcha. Se puede probar ejecutando: py -m conectores.lomas
 """
 from __future__ import annotations
@@ -9,6 +9,7 @@ import asyncio
 import json
 import re
 from dataclasses import asdict
+from io import BytesIO
 from typing import List
 from urllib.parse import urljoin
 
@@ -50,6 +51,16 @@ def _serializar_form(scope) -> dict:
 def _extraer_texto_pdf_bytes(pdf_bytes: bytes) -> str:
     if not pdf_bytes or not pdf_bytes.startswith(b"%PDF"):
         return ""
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(BytesIO(pdf_bytes))
+        texto = "\n".join(page.extract_text() or "" for page in reader.pages)
+        if texto.strip():
+            return texto
+    except Exception:
+        pass
+
     textos: list[str] = []
     for m in re.finditer(rb"\(([^()\\]{1,200})\)", pdf_bytes):
         try:
@@ -141,13 +152,7 @@ def _extraer_causas_lomas(html_text: str) -> List[tuple[Infraccion, int, dict[st
             cid = ctrl.get("id") or ""
             cname = ctrl.get("name") or ""
             cval = (ctrl.get("value") or ctrl.get_text(" ", strip=True) or "").lower()
-            href = ctrl.get("href") or ""
-            if "recibo" in cval or "recibo" in cid.lower() or "recibo" in cname.lower() or "cmd" in cname.lower():
-                m_pb = re.search(r"__doPostBack\('([^']+)'\s*,\s*'([^']*)'\)", href)
-                if m_pb:
-                    extra_post["__EVENTTARGET"] = m_pb.group(1)
-                    extra_post["__EVENTARGUMENT"] = m_pb.group(2)
-                    break
+            if "recibo" in cval or "recibo" in cid.lower() or "recibo" in cname.lower():
                 if cname:
                     extra_post[cname] = ctrl.get("value") or "Recibo"
                     break
@@ -174,8 +179,6 @@ def _extraer_campos_ocultos_aspnet(html_text: str) -> dict[str, str]:
         itype = (inp.get("type") or "text").lower()
         if itype == "hidden":
             datos[name] = inp.get("value", "")
-        elif itype == "radio" and inp.has_attr("checked"):
-            datos[name] = inp.get("value", "")
     return datos
 
 
@@ -183,53 +186,48 @@ async def _consultar_comprobante_lomas(
     client: httpx.AsyncClient,
     destino: str,
     referer_url: str,
-    base_datos: dict[str, str],
+    hidden_grilla: dict[str, str],
     patente: str,
     fila_idx: int,
     extra_fila: dict[str, str],
-    html_grilla: str,
 ) -> float | None:
-    soup = BeautifulSoup(html_grilla, "html.parser")
-    datos_comp = dict(base_datos)
-    datos_comp["__LASTFOCUS"] = ""
-    datos_comp["txtDominio"] = patente.lower()
-    datos_comp.setdefault("txtDocumento", "")
-    datos_comp.setdefault("txtCuit", "")
-    datos_comp.setdefault("SelOP", "rdbReciboImpreso")
-    datos_comp.setdefault("txtmail", "")
-    datos_comp["lblindex"] = str(fila_idx)
-
-    if extra_fila:
-        datos_comp.setdefault("__EVENTTARGET", "")
-        datos_comp.setdefault("__EVENTARGUMENT", "")
-        datos_comp.update(extra_fila)
-    else:
-        target_recibo = ""
-        for el in soup.find_all(["input", "a", "button"]):
-            el_id = el.get("id") or ""
-            el_name = el.get("name") or ""
-            el_val = (el.get("value") or el.get_text(" ", strip=True) or "").lower()
-            href = el.get("href") or ""
-            if "recibo" in el_val or "recibo" in el_id.lower() or "recibo" in el_name.lower():
-                m_pb = re.search(r"__doPostBack\('([^']+)'", href)
-                if m_pb:
-                    target_recibo = m_pb.group(1)
-                    break
-                if el_name:
-                    target_recibo = el_name
-                    break
-        datos_comp["__EVENTTARGET"] = target_recibo or "inSiguiente"
-        datos_comp["__EVENTARGUMENT"] = ""
-
+    headers = {
+        "Origin": "https://webextra.lomasdezamora.gov.ar",
+        "Referer": referer_url,
+    }
     try:
-        r_comp = await client.post(
-            destino,
-            data=datos_comp,
-            headers={
-                "Origin": "https://webextra.lomasdezamora.gov.ar",
-                "Referer": referer_url,
-            },
-        )
+        # PASO 2: Clic en el botón "Recibo" de la fila (abre el modal y genera nuevo VIEWSTATE)
+        datos_modal = dict(hidden_grilla)
+        datos_modal["__EVENTTARGET"] = ""
+        datos_modal["__EVENTARGUMENT"] = ""
+        datos_modal["__LASTFOCUS"] = ""
+        datos_modal["txtDominio"] = patente.lower()
+        datos_modal["txtDocumento"] = ""
+        datos_modal["txtCuit"] = ""
+        datos_modal["SelOP"] = "rdbReciboImpreso"
+        datos_modal["txtmail"] = ""
+        datos_modal["lblindex"] = str(fila_idx)
+        datos_modal.update(extra_fila)
+
+        r_modal = await client.post(destino, data=datos_modal, headers=headers)
+        monto = _buscar_importe_en_respuesta(r_modal)
+        if monto is not None:
+            return monto
+
+        # PASO 3: Clic en "Siguiente" dentro del modal (descarga el PDF del recibo)
+        hidden_modal = _extraer_campos_ocultos_aspnet(r_modal.text or "") or hidden_grilla
+        datos_pdf = dict(hidden_modal)
+        datos_pdf["__EVENTTARGET"] = "inSiguiente"
+        datos_pdf["__EVENTARGUMENT"] = ""
+        datos_pdf["__LASTFOCUS"] = ""
+        datos_pdf["txtDominio"] = patente.lower()
+        datos_pdf["txtDocumento"] = ""
+        datos_pdf["txtCuit"] = ""
+        datos_pdf["SelOP"] = "rdbReciboImpreso"
+        datos_pdf["txtmail"] = ""
+        datos_pdf["lblindex"] = hidden_modal.get("lblindex") or str(fila_idx)
+
+        r_comp = await client.post(destino, data=datos_pdf, headers=headers)
         monto = _buscar_importe_en_respuesta(r_comp)
         if monto is not None:
             return monto
@@ -292,7 +290,6 @@ async def consultar_lomas(patente: str, solver: CaptchaSolver | None = None) -> 
                             patente,
                             fila_idx,
                             extra_fila,
-                            r_post.text or "",
                         )
                         if monto_comp is not None:
                             inf.monto = monto_comp
@@ -303,7 +300,7 @@ async def consultar_lomas(patente: str, solver: CaptchaSolver | None = None) -> 
 
 
 if __name__ == "__main__":
-    patente_prueba = "AA123BB"
+    patente_prueba = "LVQ189"
 
     print(f"Consultando Lomas de Zamora en vivo para {patente_prueba}...")
     try:

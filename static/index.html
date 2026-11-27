@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Marcelo Nuñez Gestiones | Buscador de Infracciones</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-tag">GESTORÍA AUTOMOTOR · BUENOS AIRES</span>
+        <strong>MARCELO NUÑEZ GESTIONES</strong>
+      </div>
+      <nav class="top-actions">
+        <a id="nav-wa" class="btn btn-wa" href="#" target="_blank" rel="noopener">WhatsApp +54 9 11 2253-3325</a>
+        <a class="btn btn-ghost" href="#servicios">Servicios y Contacto</a>
+      </nav>
+    </div>
+  </header>
+
+  <section class="hero">
+    <div class="container hero-grid">
+      <div class="hero-main">
+        <div class="brand-card">
+          <img id="logo-img" src="/logo.png" alt="Marcelo Nuñez Gestiones" onerror="this.style.display='none'; document.getElementById('logo-fallback').style.display='block';" />
+          <div id="logo-fallback" class="logo-fallback" style="display:none;">MARCELO NUÑEZ · GESTIONES</div>
+          <div class="owner-info">
+            <span class="badge">● ATENCIÓN PERSONALIZADA</span>
+            <h2>Horacio Marcelo Nuñez</h2>
+            <p>Gestoría Integral Automotor · Infracciones, Descargos, Dominio y Transferencias</p>
+            <div class="contact-links">
+              <a id="hero-wa" class="chip chip-wa" href="#" target="_blank" rel="noopener">WhatsApp · +54 9 11 2253-3325</a>
+              <a class="chip chip-ig" href="https://instagram.com/marcelonunezgestiones" target="_blank" rel="noopener">@marcelonunezgestiones</a>
+              <a class="chip chip-mail" href="mailto:marcelonunezgestiones@gmail.com">marcelonunezgestiones@gmail.com</a>
+            </div>
+          </div>
+        </div>
+
+        <h1 class="hero-title">TUS MULTAS, <span>SIN VUELTAS.</span></h1>
+        <p class="hero-lead">
+          Consultá infracciones de tránsito por patente en múltiples jurisdicciones desde un solo lugar.
+          Gestión rápida, transparente y 100% online con asesoramiento directo.
+        </p>
+        <div class="hero-cta">
+          <a class="btn btn-gold" href="#buscador">Consultar patente ahora</a>
+          <a class="btn btn-ghost" href="#servicios">Ver servicios</a>
+        </div>
+      </div>
+
+      <aside class="hero-stats">
+        <div class="stat-box">
+          <strong>+5K</strong>
+          <span>Trámites realizados</span>
+        </div>
+        <div class="stat-box">
+          <strong>24H</strong>
+          <span>Tiempo promedio</span>
+        </div>
+        <div class="stat-box">
+          <strong>100%</strong>
+          <span>Gestión online</span>
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <main id="buscador" class="container main-content">
+    <section class="search-panel">
+      <div class="section-head">
+        <h2>BUSCADOR DE <span>INFRACCIONES</span></h2>
+        <p>Ingresá el dominio sin espacios ni guiones (formatos ABC123, AB123CD, A123BCD o 123ABC).</p>
+      </div>
+
+      <form id="form-consulta" class="search-form">
+        <div class="input-group">
+          <label for="patente-input">Dominio / Patente</label>
+          <input
+            id="patente-input"
+            type="text"
+            maxlength="10"
+            placeholder="Ej: LVQ189 o AB123CD"
+            autocomplete="off"
+            required
+          />
+        </div>
+        <button id="btn-consultar" type="submit" class="btn btn-gold btn-submit">
+          Consultar multas
+        </button>
+      </form>
+
+      <div class="options-row">
+        <label class="check-item">
+          <input id="chk-simulacro" type="checkbox" />
+          <span>Modo simulacro (valida portales con captcha sin gastar saldo)</span>
+        </label>
+        <label class="check-item">
+          <input id="chk-cache" type="checkbox" />
+          <span>Ignorar caché (forzar consulta nueva)</span>
+        </label>
+      </div>
+
+      <div id="form-error" class="alert alert-err" style="display:none;"></div>
+    </section>
+
+    <section class="servers-panel">
+      <div class="servers-head">
+        <strong>ESTADO DE SERVIDORES</strong>
+        <span id="servers-updated">Verificando...</span>
+      </div>
+      <div id="servers-list" class="servers-chips"></div>
+    </section>
+
+    <section id="resultados-section" class="results-section" style="display:none;">
+      <div class="results-layout">
+        <div class="results-main">
+          <div id="res-header" class="res-header"></div>
+          <div id="res-alerts"></div>
+          <div id="res-jurisdicciones"></div>
+          <div id="res-portales" class="card"></div>
+
+          <details id="json-box" class="json-card">
+            <summary>Ver respuesta estructurada en JSON</summary>
+            <div class="json-actions">
+              <button id="btn-copiar-json" type="button" class="btn btn-ghost btn-sm">Copiar JSON</button>
+              <button id="btn-descargar-json" type="button" class="btn btn-gold btn-sm">Descargar JSON</button>
+            </div>
+            <pre id="json-output"></pre>
+          </details>
+        </div>
+
+        <aside id="resumen-flotante" class="summary-float" style="display:none;"></aside>
+      </div>
+    </section>
+  </main>
+
+  <section id="servicios" class="container services-section">
+    <div class="section-head">
+      <h2>NUESTROS <span>SERVICIOS</span></h2>
+      <p>Acompañamiento integral en trámites automotores y defensa vial.</p>
+    </div>
+    <div class="services-grid">
+      <div class="service-card">Informes de dominio</div>
+      <div class="service-card">Transferencias automotor</div>
+      <div class="service-card">Radicaciones y bajas</div>
+      <div class="service-card">Consulta de infracciones</div>
+      <div class="service-card">Descargos de fotomultas</div>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <div class="container footer-inner">
+      <div>
+        <strong>Marcelo Nuñez Gestiones</strong> · Gestoría Automotor · Buenos Aires
+      </div>
+      <div class="footer-contact">
+        <span>WhatsApp: +54 9 11 2253-3325</span> ·
+        <span>Instagram: @marcelonunezgestiones</span> ·
+        <span>Correo: marcelonunezgestiones@gmail.com</span>
+      </div>
+      <p class="footer-note">
+        La información proviene de los portales oficiales consultados y tiene carácter informativo.
+      </p>
+    </div>
+  </footer>
+
+  <div id="loading-modal" class="modal-backdrop" style="display:none;">
+    <div class="modal-card">
+      <div class="spinner"></div>
+      <h3>BUSCANDO MULTAS...</h3>
+      <p id="loading-status">Consultando jurisdicciones en simultáneo...</p>
+      <div class="progress-track">
+        <div id="loading-bar" class="progress-fill"></div>
+      </div>
+      <span class="modal-tip">Tip: el resumen lateral te permitirá saltar directo a cada jurisdicción.</span>
+    </div>
+  </div>
+
+  <a id="fab-wa" class="fab-wa" href="#" target="_blank" rel="noopener">
+    Consultar por WhatsApp
+  </a>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
